@@ -15,25 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 5001;
 
 // Middleware
-// Configure CORS to allow requests from your frontend domain
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-  : ['http://localhost:3000'];
-
-app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    // In production, check against allowed origins; in dev allow all
-    if (process.env.NODE_ENV !== 'production' || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    // Still allow if not in strict mode
-    return callback(null, true);
-  },
-  credentials: true
-}));
-
+app.use(cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -50,7 +32,7 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'FMB Survey Builder API is running' });
 });
 
-// Root route - helpful for checking if server is up
+// Root route
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'FMB Survey Builder API. Use /api/* endpoints.' });
 });
@@ -64,16 +46,10 @@ app.use((err, req, res, next) => {
 // Initialize uploads dir, DB, then start server
 async function startServer() {
   try {
-    // Ensure uploads directory exists before any request handling
     await ensureUploadsDir();
-    console.log('Uploads directory ready');
-
     await initDB();
-    console.log('Database initialized');
-
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Server is running on port ${PORT}`);
-      console.log(`API available at http://0.0.0.0:${PORT}/api`);
     });
   } catch (err) {
     console.error('Failed to start server:', err);
