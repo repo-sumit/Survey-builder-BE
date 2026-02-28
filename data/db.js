@@ -60,6 +60,36 @@ async function initDB() {
       )
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS designation_hierarchy (
+        id               SERIAL PRIMARY KEY,
+        state_code       TEXT NOT NULL,
+        designation_id   INT  NOT NULL CHECK (designation_id BETWEEN 1 AND 100),
+        hierarchy_level  INT  NOT NULL,
+        designation_name TEXT NOT NULL,
+        medium           TEXT NOT NULL,
+        medium_in_english TEXT NOT NULL,
+        is_active        BOOLEAN DEFAULT TRUE,
+        created_by       TEXT,
+        updated_by       TEXT,
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(state_code, designation_id)
+      )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS access_sheet_latest_dump (
+        state_code  TEXT PRIMARY KEY,
+        dumped_at   TIMESTAMPTZ DEFAULT NOW(),
+        dumped_by   TEXT NOT NULL,
+        file_name   TEXT NOT NULL,
+        mime_type   TEXT NOT NULL DEFAULT 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        file_bytes  BYTEA NOT NULL,
+        summary     JSONB NOT NULL DEFAULT '{}'
+      )
+    `);
+
     // Ensure new columns exist on pre-existing tables (safe to run repeatedly)
     await client.query(`
       ALTER TABLE surveys ADD COLUMN IF NOT EXISTS state_code TEXT

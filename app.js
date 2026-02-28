@@ -15,6 +15,8 @@ const validateUploadRouter = require('./routes/validateUpload');
 const validationSchemaRouter = require('./routes/validationSchema');
 const importRouter = require('./routes/import');
 const translateRouter = require('./routes/translate');
+const { router: designationsRouter } = require('./routes/designations');
+const accessSheetRouter = require('./routes/accessSheet');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -38,6 +40,8 @@ app.use('/api/validation-schema', requireAuth, validationSchemaRouter);
 app.use('/api/import', requireAuth, importRouter);
 app.use('/api/translate', requireAuth, translateRouter);
 app.use('/api/admin', requireAuth, requireAdmin, adminRouter);
+app.use('/api/designations', requireAuth, designationsRouter);
+app.use('/api/access-sheet', requireAuth, accessSheetRouter);
 
 // Serve static files from React app in production
 if (process.env.NODE_ENV === 'production') {
