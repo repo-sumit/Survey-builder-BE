@@ -1,9 +1,14 @@
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const { initDB } = require('./data/db');
-const { ensureUploadsDir } = require('./data/store');
+const path = require('path');
 
+const { initStore } = require('./data/store');
+const { requireAuth, requireAdmin } = require('./middleware/auth');
+const authRouter = require('./routes/auth');
+const adminRouter = require('./routes/admin');
 const surveysRouter = require('./routes/surveys');
 const exportRouter = require('./routes/export');
 const validateUploadRouter = require('./routes/validateUpload');
@@ -16,26 +21,32 @@ const PORT = process.env.PORT || 5001;
 
 // Middleware
 app.use(cors());
-app.use(bodyParser.json({ limit: '10mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
-// Routes
-app.use('/api/surveys', surveysRouter);
-app.use('/api/export', exportRouter);
-app.use('/api/validate-upload', validateUploadRouter);
-app.use('/api/validation-schema', validationSchemaRouter);
-app.use('/api/import', importRouter);
-app.use('/api/translate', translateRouter);
-
-// Health check
+// Public routes (no auth)
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'FMB Survey Builder API is running' });
 });
+app.use('/api/auth', authRouter);
 
-// Root route
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'FMB Survey Builder API. Use /api/* endpoints.' });
-});
+// Protected routes (auth required)
+app.use('/api/surveys', requireAuth, surveysRouter);
+app.use('/api/export', requireAuth, exportRouter);
+app.use('/api/validate-upload', requireAuth, validateUploadRouter);
+app.use('/api/validation-schema', requireAuth, validationSchemaRouter);
+app.use('/api/import', requireAuth, importRouter);
+app.use('/api/translate', requireAuth, translateRouter);
+app.use('/api/admin', requireAuth, requireAdmin, adminRouter);
+
+// Serve static files from React app in production
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(__dirname, '../client/build')));
+
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../client/build', 'index.html'));
+  });
+}
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -43,20 +54,17 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Something went wrong!', message: err.message });
 });
 
-// Initialize uploads dir, DB, then start server
-async function startServer() {
-  try {
-    await ensureUploadsDir();
-    await initDB();
-    app.listen(PORT, '0.0.0.0', () => {
+// Initialize DB then start server
+initStore()
+  .then(() => {
+    app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
+      console.log(`API available at http://localhost:${PORT}/api`);
     });
-  } catch (err) {
-    console.error('Failed to start server:', err);
+  })
+  .catch(err => {
+    console.error('Failed to initialize database:', err);
     process.exit(1);
-  }
-}
-
-startServer();
+  });
 
 module.exports = app;

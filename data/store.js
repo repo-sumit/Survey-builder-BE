@@ -1,137 +1,81 @@
-const { pool } = require('./db');
+const fs = require('fs');
+const fsp = fs.promises;
 const path = require('path');
-const fsp = require('fs').promises;
+const { pool, initDB } = require('./db');
 
 const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
+const STORE_PATH = path.join(__dirname, 'store.json'); // kept for migration reference
+
+async function initStore() {
+  await initDB();
+  await ensureUploadsDir();
+}
 
 async function ensureUploadsDir() {
   await fsp.mkdir(UPLOAD_DIR, { recursive: true });
 }
 
-// ── Survey helpers ──
+async function readStore() {
+  const [surveyRows, questionRows] = await Promise.all([
+    pool.query('SELECT data, publish FROM surveys ORDER BY created_at'),
+    pool.query('SELECT data FROM questions ORDER BY created_at')
+  ]);
 
-async function getAllSurveys() {
-  const { rows } = await pool.query('SELECT data FROM surveys ORDER BY created_at');
-  return rows.map(r => r.data);
+  const surveys = surveyRows.rows.map(r => {
+    const survey = { ...r.data };
+    if (r.publish) {
+      survey.publish = r.publish;
+    } else if (!survey.publish) {
+      survey.publish = { status: 'DRAFT' };
+    }
+    return survey;
+  });
+
+  const questions = questionRows.rows.map(r => r.data);
+
+  return { surveys, questions };
 }
 
-async function getSurveyById(surveyId) {
-  const { rows } = await pool.query('SELECT data FROM surveys WHERE survey_id = $1', [surveyId]);
-  return rows.length > 0 ? rows[0].data : null;
-}
-
-async function createSurvey(surveyData) {
-  await pool.query(
-    'INSERT INTO surveys (survey_id, data) VALUES ($1, $2)',
-    [surveyData.surveyId, JSON.stringify(surveyData)]
-  );
-  return surveyData;
-}
-
-async function updateSurvey(surveyId, surveyData) {
-  const { rowCount } = await pool.query(
-    'UPDATE surveys SET data = $1, updated_at = NOW() WHERE survey_id = $2',
-    [JSON.stringify(surveyData), surveyId]
-  );
-  return rowCount > 0;
-}
-
-async function deleteSurvey(surveyId) {
-  // Questions are deleted via CASCADE
-  const { rowCount } = await pool.query('DELETE FROM surveys WHERE survey_id = $1', [surveyId]);
-  return rowCount > 0;
-}
-
-async function surveyExists(surveyId) {
-  const { rows } = await pool.query('SELECT 1 FROM surveys WHERE survey_id = $1', [surveyId]);
-  return rows.length > 0;
-}
-
-// ── Question helpers ──
-
-async function getQuestionsBySurvey(surveyId) {
-  const { rows } = await pool.query(
-    'SELECT data FROM questions WHERE survey_id = $1 ORDER BY created_at',
-    [surveyId]
-  );
-  return rows.map(r => r.data);
-}
-
-async function getQuestionById(surveyId, questionId) {
-  const { rows } = await pool.query(
-    'SELECT data FROM questions WHERE survey_id = $1 AND question_id = $2',
-    [surveyId, questionId]
-  );
-  return rows.length > 0 ? rows[0].data : null;
-}
-
-async function createQuestion(questionData) {
-  await pool.query(
-    'INSERT INTO questions (survey_id, question_id, data) VALUES ($1, $2, $3)',
-    [questionData.surveyId, questionData.questionId, JSON.stringify(questionData)]
-  );
-  return questionData;
-}
-
-async function updateQuestion(surveyId, questionId, questionData) {
-  const { rowCount } = await pool.query(
-    'UPDATE questions SET data = $1, updated_at = NOW() WHERE survey_id = $2 AND question_id = $3',
-    [JSON.stringify(questionData), surveyId, questionId]
-  );
-  return rowCount > 0;
-}
-
-async function deleteQuestion(surveyId, questionId) {
-  const { rowCount } = await pool.query(
-    'DELETE FROM questions WHERE survey_id = $1 AND question_id = $2',
-    [surveyId, questionId]
-  );
-  return rowCount > 0;
-}
-
-async function questionExists(surveyId, questionId) {
-  const { rows } = await pool.query(
-    'SELECT 1 FROM questions WHERE survey_id = $1 AND question_id = $2',
-    [surveyId, questionId]
-  );
-  return rows.length > 0;
-}
-
-async function deleteQuestionsBySurvey(surveyId) {
-  await pool.query('DELETE FROM questions WHERE survey_id = $1', [surveyId]);
-}
-
-async function getAllQuestions() {
-  const { rows } = await pool.query('SELECT data FROM questions ORDER BY created_at');
-  return rows.map(r => r.data);
-}
-
-// ── Bulk operations (for import) ──
-
-async function bulkImport(surveys, questions, overwriteSurveyIds = []) {
+async function writeStore(data) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Remove existing data for overwritten surveys
-    for (const sid of overwriteSurveyIds) {
-      await client.query('DELETE FROM surveys WHERE survey_id = $1', [sid]);
+    // Get existing survey IDs for diffing
+    const existingRes = await client.query('SELECT survey_id FROM surveys');
+    const existingIds = new Set(existingRes.rows.map(r => r.survey_id));
+    const newIds = new Set(data.surveys.map(s => s.surveyId));
+
+    // Delete surveys that are no longer present (cascade deletes their questions)
+    for (const id of existingIds) {
+      if (!newIds.has(id)) {
+        await client.query('DELETE FROM surveys WHERE survey_id = $1', [id]);
+      }
     }
 
-    // Insert surveys
-    for (const s of surveys) {
-      await client.query(
-        'INSERT INTO surveys (survey_id, data) VALUES ($1, $2)',
-        [s.surveyId, JSON.stringify(s)]
-      );
+    // Upsert surveys
+    for (const survey of data.surveys) {
+      const publish = survey.publish || { status: 'DRAFT' };
+      const stateCode = survey.stateCode || null;
+
+      await client.query(`
+        INSERT INTO surveys (survey_id, state_code, data, publish, updated_at)
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (survey_id) DO UPDATE SET
+          state_code = $2,
+          data = $3,
+          publish = $4,
+          updated_at = NOW()
+      `, [survey.surveyId, stateCode, survey, publish]);
     }
 
-    // Insert questions
-    for (const q of questions) {
-      await client.query(
-        'INSERT INTO questions (survey_id, question_id, data) VALUES ($1, $2, $3)',
-        [q.surveyId, q.questionId, JSON.stringify(q)]
-      );
+    // Rebuild questions: delete all then re-insert
+    await client.query('DELETE FROM questions');
+    for (const q of data.questions) {
+      await client.query(`
+        INSERT INTO questions (survey_id, question_id, data, updated_at)
+        VALUES ($1, $2, $3, NOW())
+      `, [q.surveyId, q.questionId, q]);
     }
 
     await client.query('COMMIT');
@@ -143,35 +87,11 @@ async function bulkImport(surveys, questions, overwriteSurveyIds = []) {
   }
 }
 
-// ── Legacy readStore/writeStore compatibility (used by validator during import) ──
-
-async function readStore() {
-  const surveys = await getAllSurveys();
-  const questions = await getAllQuestions();
-  return { surveys, questions };
-}
-
 module.exports = {
+  STORE_PATH,
   UPLOAD_DIR,
-  ensureUploadsDir,
-  // Survey
-  getAllSurveys,
-  getSurveyById,
-  createSurvey,
-  updateSurvey,
-  deleteSurvey,
-  surveyExists,
-  // Question
-  getQuestionsBySurvey,
-  getQuestionById,
-  createQuestion,
-  updateQuestion,
-  deleteQuestion,
-  questionExists,
-  deleteQuestionsBySurvey,
-  getAllQuestions,
-  // Bulk
-  bulkImport,
-  // Legacy
-  readStore
+  initStore,
+  readStore,
+  writeStore,
+  ensureUploadsDir
 };

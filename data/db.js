@@ -1,68 +1,102 @@
-const dns = require('dns');
 const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
 
-// Force IPv4 DNS resolution - fixes Render/Supabase IPv6 connectivity issues
-dns.setDefaultResultOrder('ipv4first');
+const dbUrl = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/fmb_survey_builder';
 
-// Validate DATABASE_URL is set in production
-if (process.env.NODE_ENV === 'production' && !process.env.DATABASE_URL) {
-  console.error('FATAL: DATABASE_URL environment variable is not set.');
-  process.exit(1);
-}
-
-const connectionString = process.env.DATABASE_URL;
+// Supabase (and most cloud providers) require SSL; local dev does not
+const isCloudDB = dbUrl.includes('supabase.com') || dbUrl.includes('neon.tech') || process.env.NODE_ENV === 'production';
 
 const pool = new Pool({
-  connectionString: connectionString || 'postgresql://postgres:postgres@localhost:5432/postgres',
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000
-});
-
-pool.on('error', (err) => {
-  console.error('Unexpected PostgreSQL pool error:', err.message);
+  connectionString: dbUrl,
+  ssl: isCloudDB ? { rejectUnauthorized: false } : false
 });
 
 async function initDB() {
-  let client;
+  const client = await pool.connect();
   try {
-    client = await pool.connect();
-    console.log('Connected to PostgreSQL database');
+    await client.query('BEGIN');
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS surveys (
-        survey_id TEXT PRIMARY KEY,
-        data JSONB NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      );
+        survey_id   TEXT PRIMARY KEY,
+        state_code  TEXT,
+        data        JSONB NOT NULL,
+        publish     JSONB NOT NULL DEFAULT '{"status":"DRAFT"}',
+        created_at  TIMESTAMPTZ DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ DEFAULT NOW()
+      )
     `);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS questions (
-        id SERIAL PRIMARY KEY,
-        survey_id TEXT NOT NULL REFERENCES surveys(survey_id) ON DELETE CASCADE,
+        survey_id   TEXT NOT NULL REFERENCES surveys(survey_id) ON DELETE CASCADE,
         question_id TEXT NOT NULL,
-        data JSONB NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(survey_id, question_id)
-      );
+        data        JSONB NOT NULL,
+        created_at  TIMESTAMPTZ DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (survey_id, question_id)
+      )
     `);
 
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_questions_survey_id ON questions(survey_id);
+      CREATE TABLE IF NOT EXISTS users (
+        id           SERIAL PRIMARY KEY,
+        username     TEXT UNIQUE NOT NULL,
+        password     TEXT NOT NULL,
+        role         TEXT NOT NULL DEFAULT 'state',
+        state_code   TEXT,
+        is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at   TIMESTAMPTZ DEFAULT NOW(),
+        updated_at   TIMESTAMPTZ DEFAULT NOW()
+      )
     `);
 
-    console.log('Database tables initialized successfully');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS survey_locks (
+        survey_id   TEXT PRIMARY KEY REFERENCES surveys(survey_id) ON DELETE CASCADE,
+        locked_by   INTEGER NOT NULL REFERENCES users(id),
+        locked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at  TIMESTAMPTZ NOT NULL
+      )
+    `);
+
+    // Ensure new columns exist on pre-existing tables (safe to run repeatedly)
+    await client.query(`
+      ALTER TABLE surveys ADD COLUMN IF NOT EXISTS state_code TEXT
+    `);
+    await client.query(`
+      ALTER TABLE surveys ADD COLUMN IF NOT EXISTS publish JSONB NOT NULL DEFAULT '{"status":"DRAFT"}'
+    `);
+    await client.query(`
+      ALTER TABLE surveys ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
+    `);
+    await client.query(`
+      ALTER TABLE surveys ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()
+    `);
+
+    await client.query('COMMIT');
+
+    // Seed admin user if env vars are set
+    const seedUser = process.env.SEED_ADMIN_USER;
+    const seedPass = process.env.SEED_ADMIN_PASSWORD;
+    if (seedUser && seedPass) {
+      const existing = await pool.query('SELECT id FROM users WHERE username = $1', [seedUser]);
+      if (existing.rows.length === 0) {
+        const hash = await bcrypt.hash(seedPass, 10);
+        await pool.query(
+          'INSERT INTO users (username, password, role, state_code, is_active) VALUES ($1, $2, $3, NULL, TRUE)',
+          [seedUser, hash, 'admin']
+        );
+        console.log(`Seeded admin user: ${seedUser}`);
+      }
+    }
+
+    console.log('Database tables initialized');
   } catch (err) {
-    console.error('Database initialization failed:', err.message);
+    await client.query('ROLLBACK');
     throw err;
   } finally {
-    if (client) {
-      client.release();
-    }
+    client.release();
   }
 }
 
