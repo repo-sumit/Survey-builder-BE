@@ -347,14 +347,5 @@ curl http://localhost:5000/api/surveys \
 
 ---
 
-## 12) Roadmap Suggestions (optional hardening)
-- Add OpenAPI/Swagger spec for endpoints
-- Add request logging + structured logs
-- Tighten CORS for prod
-- Add DB migrations (Flyway/Knex/Prisma) if schema expands
-- Add test suite (Jest + Supertest) for critical flows
-
----
-
 ## License
 TODO
