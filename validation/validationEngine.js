@@ -721,8 +721,8 @@ class ValidationEngine {
         return 'Hierarchical Access Level must contain only numeric values';
       }
       const num = parseInt(level);
-      if (num < 1 || num > 7) {
-        return 'Hierarchical Access Level values must be between 1 and 7';
+      if (num < 1 || num > 100) {
+        return 'Hierarchical Access Level values must be between 1 and 100';
       }
     }
 
