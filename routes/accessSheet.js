@@ -22,11 +22,11 @@ router.post('/dump', requireAuth, async (req, res) => {
     const stateCode = resolveState(req, req.body);
     if (!stateCode) return res.status(400).json({ error: 'State code is required' });
 
-    // Fetch active designations for this state
+    // Fetch designations for this state
     const desgResult = await pool.query(
       `SELECT * FROM designation_hierarchy
-        WHERE state_code=$1 AND is_active=true
-        ORDER BY hierarchy_level, designation_id`,
+        WHERE state_code=$1
+        ORDER BY medium_in_english, hierarchy_level`,
       [stateCode]
     );
     const designations = desgResult.rows;

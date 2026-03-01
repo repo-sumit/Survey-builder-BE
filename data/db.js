@@ -64,7 +64,7 @@ async function initDB() {
       CREATE TABLE IF NOT EXISTS designation_hierarchy (
         id               SERIAL PRIMARY KEY,
         state_code       TEXT NOT NULL,
-        designation_id   INT  NOT NULL CHECK (designation_id BETWEEN 1 AND 100),
+        designation_id   INT,
         hierarchy_level  INT  NOT NULL,
         designation_name TEXT NOT NULL,
         medium           TEXT NOT NULL,
@@ -74,8 +74,45 @@ async function initDB() {
         updated_by       TEXT,
         created_at       TIMESTAMPTZ DEFAULT NOW(),
         updated_at       TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(state_code, designation_id)
+        UNIQUE(state_code, medium_in_english, hierarchy_level)
       )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS state_config (
+        state_code          TEXT PRIMARY KEY,
+        state_name          TEXT NOT NULL,
+        available_languages TEXT NOT NULL DEFAULT ''
+      )
+    `);
+
+    // Migration: relax designation_id on existing tables
+    await client.query(`
+      ALTER TABLE designation_hierarchy ALTER COLUMN designation_id DROP NOT NULL
+    `).catch(() => {});
+
+    // Migration: drop old unique constraint and add new one
+    await client.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE table_name='designation_hierarchy'
+            AND constraint_name='designation_hierarchy_state_code_designation_id_key'
+        ) THEN
+          ALTER TABLE designation_hierarchy
+            DROP CONSTRAINT designation_hierarchy_state_code_designation_id_key;
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE table_name='designation_hierarchy'
+            AND constraint_name='designation_hierarchy_state_code_medium_in_english_hierarchy_level_key'
+        ) THEN
+          ALTER TABLE designation_hierarchy
+            ADD CONSTRAINT designation_hierarchy_state_code_medium_in_english_hierarchy_level_key
+            UNIQUE(state_code, medium_in_english, hierarchy_level);
+        END IF;
+      END $$;
     `);
 
     await client.query(`

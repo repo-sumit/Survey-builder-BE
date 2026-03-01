@@ -138,4 +138,91 @@ router.patch('/users/:id', requireWriteAccess, async (req, res) => {
   }
 });
 
+// ── State Config CRUD ────────────────────────────────────────────────────────
+
+// GET /api/admin/state-config
+router.get('/state-config', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT state_code, state_name, available_languages FROM state_config ORDER BY state_name'
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('List state config error:', err);
+    res.status(500).json({ error: 'Failed to list state configs', message: err.message });
+  }
+});
+
+// POST /api/admin/state-config
+router.post('/state-config', requireWriteAccess, async (req, res) => {
+  try {
+    const { state_code, state_name, available_languages } = req.body;
+    if (!state_code || !state_name)
+      return res.status(400).json({ error: 'state_code and state_name are required' });
+
+    const result = await pool.query(
+      `INSERT INTO state_config (state_code, state_name, available_languages)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (state_code) DO UPDATE
+         SET state_name = EXCLUDED.state_name,
+             available_languages = EXCLUDED.available_languages
+       RETURNING *`,
+      [state_code.trim(), state_name.trim(), (available_languages || '').trim()]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error('Create state config error:', err);
+    res.status(500).json({ error: 'Failed to create state config', message: err.message });
+  }
+});
+
+// PATCH /api/admin/state-config/:state_code
+router.patch('/state-config/:state_code', requireWriteAccess, async (req, res) => {
+  try {
+    const { state_code } = req.params;
+    const { state_name, available_languages } = req.body;
+
+    const existing = await pool.query('SELECT * FROM state_config WHERE state_code=$1', [state_code]);
+    if (existing.rows.length === 0)
+      return res.status(404).json({ error: 'State config not found' });
+
+    const setClauses = [];
+    const values = [];
+    let i = 1;
+
+    if (state_name !== undefined) { setClauses.push(`state_name=$${i++}`); values.push(state_name.trim()); }
+    if (available_languages !== undefined) { setClauses.push(`available_languages=$${i++}`); values.push(available_languages.trim()); }
+
+    if (setClauses.length === 0)
+      return res.status(400).json({ error: 'No fields to update' });
+
+    values.push(state_code);
+    const result = await pool.query(
+      `UPDATE state_config SET ${setClauses.join(', ')} WHERE state_code=$${i} RETURNING *`,
+      values
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Update state config error:', err);
+    res.status(500).json({ error: 'Failed to update state config', message: err.message });
+  }
+});
+
+// DELETE /api/admin/state-config/:state_code
+router.delete('/state-config/:state_code', requireWriteAccess, async (req, res) => {
+  try {
+    const { state_code } = req.params;
+    const result = await pool.query(
+      'DELETE FROM state_config WHERE state_code=$1 RETURNING state_code',
+      [state_code]
+    );
+    if (result.rows.length === 0)
+      return res.status(404).json({ error: 'State config not found' });
+    res.json({ deleted: true });
+  } catch (err) {
+    console.error('Delete state config error:', err);
+    res.status(500).json({ error: 'Failed to delete state config', message: err.message });
+  }
+});
+
 module.exports = router;
