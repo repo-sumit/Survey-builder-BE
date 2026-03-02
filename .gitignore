@@ -6,8 +6,7 @@ node_modules/
 .env.local
 .env.production
 
-# Data / uploads
-data/store.json
+# Uploads
 uploads/*
 !uploads/.gitignore
 
