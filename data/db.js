@@ -3,12 +3,18 @@ const bcrypt = require('bcryptjs');
 
 const dbUrl = process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/fmb_survey_builder';
 
-// Supabase (and most cloud providers) require SSL; local dev does not
-const isCloudDB = dbUrl.includes('supabase.com') || dbUrl.includes('neon.tech') || process.env.NODE_ENV === 'production';
+// Cloud providers require SSL; local dev does not
+const isCloudDB = /supabase\.com|neon\.tech|railway\.app|render\.com|cockroachlabs\.com|googleapis\.com|cloudsql/i.test(dbUrl)
+  || process.env.NODE_ENV === 'production'
+  || process.env.DB_SSL === 'true';
 
 const pool = new Pool({
   connectionString: dbUrl,
-  ssl: isCloudDB ? { rejectUnauthorized: false } : false
+  ssl: isCloudDB ? { rejectUnauthorized: false } : false,
+  // Pool tuning for performance
+  max: 10,                   // max 10 connections (default 10, explicit for clarity)
+  idleTimeoutMillis: 30000,  // close idle connections after 30s
+  connectionTimeoutMillis: 5000, // fail fast if DB is unreachable
 });
 
 async function initDB() {
@@ -126,6 +132,12 @@ async function initDB() {
         summary     JSONB NOT NULL DEFAULT '{}'
       )
     `);
+
+    // Indexes for performance
+    await client.query('CREATE INDEX IF NOT EXISTS idx_surveys_state_code ON surveys(state_code)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_questions_survey_id ON questions(survey_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_designation_state ON designation_hierarchy(state_code)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)');
 
     // Ensure new columns exist on pre-existing tables (safe to run repeatedly)
     await client.query(`

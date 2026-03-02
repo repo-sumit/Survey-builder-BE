@@ -2,6 +2,7 @@ require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const bodyParser = require('body-parser');
 const path = require('path');
 
@@ -22,6 +23,7 @@ const app = express();
 const PORT = process.env.PORT || 5001;
 
 // Middleware
+app.use(compression());  // gzip all responses — major speed boost
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));

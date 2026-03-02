@@ -36,6 +36,87 @@ async function readStore() {
   return { surveys, questions };
 }
 
+/* ─── Targeted queries — avoid loading the entire store ─── */
+
+/** List surveys only (no questions loaded). Optionally filter by stateCode. */
+async function listSurveys(stateCode) {
+  const query = stateCode
+    ? 'SELECT data, publish FROM surveys WHERE state_code = $1 ORDER BY created_at'
+    : 'SELECT data, publish FROM surveys ORDER BY created_at';
+  const params = stateCode ? [stateCode] : [];
+  const { rows } = await pool.query(query, params);
+  return rows.map(r => {
+    const survey = { ...r.data };
+    survey.publish = r.publish || survey.publish || { status: 'DRAFT' };
+    return survey;
+  });
+}
+
+/** Get a single survey by ID. Returns null if not found. */
+async function getSurvey(surveyId) {
+  const { rows } = await pool.query(
+    'SELECT data, publish FROM surveys WHERE survey_id = $1',
+    [surveyId]
+  );
+  if (rows.length === 0) return null;
+  const survey = { ...rows[0].data };
+  survey.publish = rows[0].publish || survey.publish || { status: 'DRAFT' };
+  return survey;
+}
+
+/** Get questions for a single survey. */
+async function getQuestions(surveyId) {
+  const { rows } = await pool.query(
+    'SELECT data FROM questions WHERE survey_id = $1 ORDER BY created_at',
+    [surveyId]
+  );
+  return rows.map(r => r.data);
+}
+
+/** Get a single question. Returns null if not found. */
+async function getQuestion(surveyId, questionId) {
+  const { rows } = await pool.query(
+    'SELECT data FROM questions WHERE survey_id = $1 AND question_id = $2',
+    [surveyId, questionId]
+  );
+  return rows.length ? rows[0].data : null;
+}
+
+/** Upsert a single survey (without touching questions). */
+async function upsertSurvey(survey) {
+  const publish = survey.publish || { status: 'DRAFT' };
+  const stateCode = survey.stateCode || null;
+  await pool.query(`
+    INSERT INTO surveys (survey_id, state_code, data, publish, updated_at)
+    VALUES ($1, $2, $3, $4, NOW())
+    ON CONFLICT (survey_id) DO UPDATE SET
+      state_code = $2, data = $3, publish = $4, updated_at = NOW()
+  `, [survey.surveyId, stateCode, survey, publish]);
+}
+
+/** Delete a single survey (cascade deletes its questions). */
+async function deleteSurvey(surveyId) {
+  await pool.query('DELETE FROM surveys WHERE survey_id = $1', [surveyId]);
+}
+
+/** Upsert a single question. */
+async function upsertQuestion(question) {
+  await pool.query(`
+    INSERT INTO questions (survey_id, question_id, data, updated_at)
+    VALUES ($1, $2, $3, NOW())
+    ON CONFLICT (survey_id, question_id) DO UPDATE SET
+      data = $3, updated_at = NOW()
+  `, [question.surveyId, question.questionId, question]);
+}
+
+/** Delete a single question. */
+async function deleteQuestion(surveyId, questionId) {
+  await pool.query(
+    'DELETE FROM questions WHERE survey_id = $1 AND question_id = $2',
+    [surveyId, questionId]
+  );
+}
+
 async function writeStore(data) {
   const client = await pool.connect();
   try {
@@ -93,5 +174,14 @@ module.exports = {
   initStore,
   readStore,
   writeStore,
-  ensureUploadsDir
+  ensureUploadsDir,
+  // Targeted queries (performance)
+  listSurveys,
+  getSurvey,
+  getQuestions,
+  getQuestion,
+  upsertSurvey,
+  deleteSurvey,
+  upsertQuestion,
+  deleteQuestion
 };

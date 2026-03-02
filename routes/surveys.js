@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const validator = require('../services/validator');
-const { readStore, writeStore } = require('../data/store');
+const { readStore, writeStore, listSurveys, getSurvey, getQuestions, getQuestion, upsertSurvey, deleteSurvey: deleteSurveyRow, upsertQuestion, deleteQuestion: deleteQuestionRow } = require('../data/store');
 const { pool } = require('../data/db');
 const { requireWriteAccess } = require('../middleware/auth');
 
@@ -86,14 +86,8 @@ async function checkLock(surveyId, userId) {
 // GET /api/surveys - List all surveys
 router.get('/', async (req, res) => {
   try {
-    const store = await readStore();
-    let surveys = store.surveys;
-
-    // State scoping
-    if (req.user.role !== 'admin') {
-      surveys = surveys.filter(s => s.stateCode && s.stateCode === req.user.stateCode);
-    }
-
+    const stateCode = req.user.role !== 'admin' ? req.user.stateCode : null;
+    const surveys = await listSurveys(stateCode);
     res.json(surveys);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch surveys', message: error.message });
@@ -103,17 +97,9 @@ router.get('/', async (req, res) => {
 // GET /api/surveys/:id - Get survey by ID
 router.get('/:id', async (req, res) => {
   try {
-    const store = await readStore();
-    const survey = store.surveys.find(s => s.surveyId === req.params.id);
-
-    if (!survey) {
-      return res.status(404).json({ error: 'Survey not found' });
-    }
-
-    if (!verifySurveyAccess(survey, req.user)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
+    const survey = await getSurvey(req.params.id);
+    if (!survey) return res.status(404).json({ error: 'Survey not found' });
+    if (!verifySurveyAccess(survey, req.user)) return res.status(403).json({ error: 'Access denied' });
     res.json(survey);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch survey', message: error.message });
@@ -166,19 +152,16 @@ router.post('/', requireWriteAccess, async (req, res) => {
       });
     }
 
-    const store = await readStore();
-
-    // Check if survey ID already exists
-    if (store.surveys.find(s => s.surveyId === surveyData.surveyId)) {
+    // Check if survey ID already exists (targeted query)
+    const existing = await getSurvey(surveyData.surveyId);
+    if (existing) {
       return res.status(400).json({
         error: 'Survey ID already exists',
         errors: [`Survey ID "${surveyData.surveyId}" already exists. Please use a unique Survey ID.`]
       });
     }
 
-    store.surveys.push(surveyData);
-    await writeStore(store);
-
+    await upsertSurvey(surveyData);
     res.status(201).json(surveyData);
   } catch (error) {
     console.error('Survey creation error:', error);
@@ -213,17 +196,12 @@ router.put('/:id', requireWriteAccess, async (req, res) => {
       });
     }
 
-    const store = await readStore();
-    const index = store.surveys.findIndex(s => s.surveyId === req.params.id);
-
-    if (index === -1) {
-      return res.status(404).json({
-        error: 'Survey not found',
-        errors: ['Survey not found']
-      });
+    const existingSurvey = await getSurvey(req.params.id);
+    if (!existingSurvey) {
+      return res.status(404).json({ error: 'Survey not found', errors: ['Survey not found'] });
     }
 
-    if (!verifySurveyAccess(store.surveys[index], req.user)) {
+    if (!verifySurveyAccess(existingSurvey, req.user)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -235,15 +213,13 @@ router.put('/:id', requireWriteAccess, async (req, res) => {
 
     // Preserve stateCode and publish from existing survey if not admin
     if (req.user.role !== 'admin') {
-      surveyData.stateCode = store.surveys[index].stateCode;
+      surveyData.stateCode = existingSurvey.stateCode;
     }
     if (!surveyData.publish) {
-      surveyData.publish = store.surveys[index].publish || { status: 'DRAFT' };
+      surveyData.publish = existingSurvey.publish || { status: 'DRAFT' };
     }
 
-    store.surveys[index] = surveyData;
-    await writeStore(store);
-
+    await upsertSurvey(surveyData);
     res.json(surveyData);
   } catch (error) {
     console.error('Survey update error:', error);
@@ -258,26 +234,16 @@ router.put('/:id', requireWriteAccess, async (req, res) => {
 // DELETE /api/surveys/:id - Delete survey
 router.delete('/:id', requireWriteAccess, async (req, res) => {
   try {
-    const store = await readStore();
-    const index = store.surveys.findIndex(s => s.surveyId === req.params.id);
-
-    if (index === -1) {
-      return res.status(404).json({ error: 'Survey not found' });
-    }
-
-    if (!verifySurveyAccess(store.surveys[index], req.user)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    const survey = await getSurvey(req.params.id);
+    if (!survey) return res.status(404).json({ error: 'Survey not found' });
+    if (!verifySurveyAccess(survey, req.user)) return res.status(403).json({ error: 'Access denied' });
 
     // Publish guard
-    if (isPublishEnabled() && isPublished(store.surveys[index])) {
+    if (isPublishEnabled() && isPublished(survey)) {
       return res.status(403).json({ error: 'Cannot delete a published survey' });
     }
 
-    store.surveys.splice(index, 1);
-    store.questions = store.questions.filter(q => q.surveyId !== req.params.id);
-    await writeStore(store);
-
+    await deleteSurveyRow(req.params.id); // CASCADE deletes questions
     res.json({ message: 'Survey deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete survey', message: error.message });
@@ -289,14 +255,12 @@ router.delete('/:id', requireWriteAccess, async (req, res) => {
 // GET /api/surveys/:id/questions - Get questions for a survey
 router.get('/:id/questions', async (req, res) => {
   try {
-    const store = await readStore();
-    const survey = store.surveys.find(s => s.surveyId === req.params.id);
-
+    const survey = await getSurvey(req.params.id);
     if (survey && !verifySurveyAccess(survey, req.user)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const questions = store.questions.filter(q => q.surveyId === req.params.id);
+    const questions = await getQuestions(req.params.id);
     res.json(questions);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch questions', message: error.message });
@@ -308,9 +272,7 @@ router.post('/:id/questions', requireWriteAccess, async (req, res) => {
   try {
     const questionData = { ...req.body, surveyId: req.params.id };
 
-    const store = await readStore();
-
-    const survey = store.surveys.find(s => s.surveyId === req.params.id);
+    const survey = await getSurvey(req.params.id);
     if (!survey) {
       return res.status(404).json({
         error: 'Survey not found',
@@ -347,7 +309,11 @@ router.post('/:id/questions', requireWriteAccess, async (req, res) => {
       });
     }
 
-    const validation = validator.validateQuestion(questionData, store.surveys, store.questions);
+    // Fetch surveys + questions for this survey only (for validator)
+    const surveys = await listSurveys();
+    const questions = await getQuestions(req.params.id);
+
+    const validation = validator.validateQuestion(questionData, surveys, questions);
     if (!validation.isValid) {
       return res.status(400).json({
         error: 'Validation failed',
@@ -355,16 +321,16 @@ router.post('/:id/questions', requireWriteAccess, async (req, res) => {
       });
     }
 
-    if (store.questions.find(q => q.surveyId === req.params.id && q.questionId === questionData.questionId)) {
+    // Check duplicate question ID
+    const existingQ = await getQuestion(req.params.id, questionData.questionId);
+    if (existingQ) {
       return res.status(400).json({
         error: 'Question ID already exists',
         errors: [`Question ID "${questionData.questionId}" already exists for this survey. Please use a unique Question ID.`]
       });
     }
 
-    store.questions.push(questionData);
-    await writeStore(store);
-
+    await upsertQuestion(questionData);
     res.status(201).json(questionData);
   } catch (error) {
     console.error('Question creation error:', error);
@@ -381,18 +347,14 @@ router.put('/:id/questions/:questionId', requireWriteAccess, async (req, res) =>
   try {
     const questionData = { ...req.body, surveyId: req.params.id, questionId: req.params.questionId };
 
-    const store = await readStore();
-
-    const survey = store.surveys.find(s => s.surveyId === req.params.id);
+    const survey = await getSurvey(req.params.id);
     if (survey && !verifySurveyAccess(survey, req.user)) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
     // Publish guard: block questionType change on published survey
     if (isPublishEnabled() && survey && isPublished(survey)) {
-      const existingQ = store.questions.find(
-        q => q.surveyId === req.params.id && q.questionId === req.params.questionId
-      );
+      const existingQ = await getQuestion(req.params.id, req.params.questionId);
       if (existingQ && questionData.questionType !== existingQ.questionType) {
         return res.status(403).json({ error: 'Cannot change question type on a published survey' });
       }
@@ -404,7 +366,10 @@ router.put('/:id/questions/:questionId', requireWriteAccess, async (req, res) =>
       return res.status(409).json({ error: `Survey is locked by ${lock.lockedBy}` });
     }
 
-    const validation = validator.validateQuestion(questionData, store.surveys, store.questions);
+    const surveys = await listSurveys();
+    const questions = await getQuestions(req.params.id);
+
+    const validation = validator.validateQuestion(questionData, surveys, questions);
     if (!validation.isValid) {
       return res.status(400).json({
         error: 'Validation failed',
@@ -412,20 +377,12 @@ router.put('/:id/questions/:questionId', requireWriteAccess, async (req, res) =>
       });
     }
 
-    const index = store.questions.findIndex(
-      q => q.surveyId === req.params.id && q.questionId === req.params.questionId
-    );
-
-    if (index === -1) {
-      return res.status(404).json({
-        error: 'Question not found',
-        errors: ['Question not found']
-      });
+    const existingQ = await getQuestion(req.params.id, req.params.questionId);
+    if (!existingQ) {
+      return res.status(404).json({ error: 'Question not found', errors: ['Question not found'] });
     }
 
-    store.questions[index] = questionData;
-    await writeStore(store);
-
+    await upsertQuestion(questionData);
     res.json(questionData);
   } catch (error) {
     console.error('Question update error:', error);
@@ -440,9 +397,7 @@ router.put('/:id/questions/:questionId', requireWriteAccess, async (req, res) =>
 // DELETE /api/surveys/:id/questions/:questionId - Delete question
 router.delete('/:id/questions/:questionId', requireWriteAccess, async (req, res) => {
   try {
-    const store = await readStore();
-
-    const survey = store.surveys.find(s => s.surveyId === req.params.id);
+    const survey = await getSurvey(req.params.id);
     if (survey && !verifySurveyAccess(survey, req.user)) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -452,17 +407,10 @@ router.delete('/:id/questions/:questionId', requireWriteAccess, async (req, res)
       return res.status(403).json({ error: 'Cannot delete questions from a published survey' });
     }
 
-    const index = store.questions.findIndex(
-      q => q.surveyId === req.params.id && q.questionId === req.params.questionId
-    );
+    const existingQ = await getQuestion(req.params.id, req.params.questionId);
+    if (!existingQ) return res.status(404).json({ error: 'Question not found' });
 
-    if (index === -1) {
-      return res.status(404).json({ error: 'Question not found' });
-    }
-
-    store.questions.splice(index, 1);
-    await writeStore(store);
-
+    await deleteQuestionRow(req.params.id, req.params.questionId);
     res.json({ message: 'Question deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete question', message: error.message });
@@ -480,20 +428,12 @@ router.post('/:id/duplicate', requireWriteAccess, async (req, res) => {
       return res.status(400).json({ error: 'New Survey ID is required' });
     }
 
-    const store = await readStore();
+    const originalSurvey = await getSurvey(req.params.id);
+    if (!originalSurvey) return res.status(404).json({ error: 'Survey not found' });
+    if (!verifySurveyAccess(originalSurvey, req.user)) return res.status(403).json({ error: 'Access denied' });
 
-    const originalSurvey = store.surveys.find(s => s.surveyId === req.params.id);
-    if (!originalSurvey) {
-      return res.status(404).json({ error: 'Survey not found' });
-    }
-
-    if (!verifySurveyAccess(originalSurvey, req.user)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    if (store.surveys.find(s => s.surveyId === newSurveyId)) {
-      return res.status(400).json({ error: 'Survey ID already exists' });
-    }
+    const existingNew = await getSurvey(newSurveyId);
+    if (existingNew) return res.status(400).json({ error: 'Survey ID already exists' });
 
     const duplicatedSurvey = {
       ...originalSurvey,
@@ -513,15 +453,17 @@ router.post('/:id/duplicate', requireWriteAccess, async (req, res) => {
       return res.status(400).json({ errors: validation.errors });
     }
 
-    const originalQuestions = store.questions.filter(q => q.surveyId === req.params.id);
+    const originalQuestions = await getQuestions(req.params.id);
     const duplicatedQuestions = originalQuestions.map(q => ({
       ...q,
       surveyId: newSurveyId
     }));
 
-    store.surveys.push(duplicatedSurvey);
-    store.questions.push(...duplicatedQuestions);
-    await writeStore(store);
+    // Write survey + questions in a single pass
+    await upsertSurvey(duplicatedSurvey);
+    for (const q of duplicatedQuestions) {
+      await upsertQuestion(q);
+    }
 
     res.status(201).json({
       survey: duplicatedSurvey,
@@ -538,9 +480,7 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
     const { surveyId, questionId } = req.params;
     const requestedQuestionId = normalizeQuestionId(req.body?.newQuestionId);
 
-    const store = await readStore();
-
-    const survey = store.surveys.find(s => s.surveyId === surveyId);
+    const survey = await getSurvey(surveyId);
     if (survey && !verifySurveyAccess(survey, req.user)) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -550,13 +490,8 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
       return res.status(403).json({ error: 'Cannot duplicate questions on a published survey' });
     }
 
-    const originalQuestion = store.questions.find(
-      q => q.surveyId === surveyId && q.questionId === questionId
-    );
-
-    if (!originalQuestion) {
-      return res.status(404).json({ error: 'Question not found' });
-    }
+    const originalQuestion = await getQuestion(surveyId, questionId);
+    if (!originalQuestion) return res.status(404).json({ error: 'Question not found' });
 
     let newQuestionId = requestedQuestionId;
 
@@ -569,7 +504,7 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
         });
       }
     } else {
-      const surveyQuestions = store.questions.filter(q => q.surveyId === surveyId);
+      const surveyQuestions = await getQuestions(surveyId);
       const questionNumbers = surveyQuestions
         .map(q => {
           const match = q.questionId.match(/^Q(\d+)(?:\.(\d+))?$/);
@@ -590,7 +525,8 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
       optionChildren: originalQuestion.optionChildren || ''
     };
 
-    if (store.questions.find(q => q.surveyId === surveyId && q.questionId === newQuestionId)) {
+    const existingQ = await getQuestion(surveyId, newQuestionId);
+    if (existingQ) {
       return res.status(400).json({
         error: 'Question ID already exists',
         message: `Question ID "${newQuestionId}" already exists for this survey`,
@@ -598,14 +534,15 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
       });
     }
 
-    const validation = validator.validateQuestion(duplicatedQuestion, store.surveys, store.questions);
+    const surveys = await listSurveys();
+    const questions = await getQuestions(surveyId);
+
+    const validation = validator.validateQuestion(duplicatedQuestion, surveys, questions);
     if (!validation.isValid) {
       return res.status(400).json({ errors: validation.errors });
     }
 
-    store.questions.push(duplicatedQuestion);
-    await writeStore(store);
-
+    await upsertQuestion(duplicatedQuestion);
     res.status(201).json(duplicatedQuestion);
   } catch (error) {
     res.status(500).json({ error: 'Failed to duplicate question', message: error.message });
@@ -617,16 +554,9 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
 // POST /api/surveys/:id/lock - Acquire lock
 router.post('/:id/lock', requireWriteAccess, async (req, res) => {
   try {
-    const store = await readStore();
-    const survey = store.surveys.find(s => s.surveyId === req.params.id);
-
-    if (!survey) {
-      return res.status(404).json({ error: 'Survey not found' });
-    }
-
-    if (!verifySurveyAccess(survey, req.user)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    const survey = await getSurvey(req.params.id);
+    if (!survey) return res.status(404).json({ error: 'Survey not found' });
+    if (!verifySurveyAccess(survey, req.user)) return res.status(403).json({ error: 'Access denied' });
 
     const result = await acquireLock(req.params.id, req.user.id);
 
@@ -693,30 +623,23 @@ router.post('/:id/publish', requireWriteAccess, async (req, res) => {
       return res.json({ message: 'Publish feature is not enabled', featureEnabled: false });
     }
 
-    const store = await readStore();
-    const index = store.surveys.findIndex(s => s.surveyId === req.params.id);
+    const survey = await getSurvey(req.params.id);
+    if (!survey) return res.status(404).json({ error: 'Survey not found' });
+    if (!verifySurveyAccess(survey, req.user)) return res.status(403).json({ error: 'Access denied' });
 
-    if (index === -1) {
-      return res.status(404).json({ error: 'Survey not found' });
-    }
-
-    if (!verifySurveyAccess(store.surveys[index], req.user)) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    const questions = store.questions.filter(q => q.surveyId === req.params.id);
+    const questions = await getQuestions(req.params.id);
     if (questions.length === 0) {
       return res.status(400).json({ error: 'Cannot publish a survey with no questions' });
     }
 
-    store.surveys[index].publish = {
+    survey.publish = {
       status: 'PUBLISHED',
       publishedAt: new Date().toISOString(),
       publishedBy: req.user.username
     };
-    await writeStore(store);
+    await upsertSurvey(survey);
 
-    res.json({ message: 'Survey published', publish: store.surveys[index].publish });
+    res.json({ message: 'Survey published', publish: survey.publish });
   } catch (error) {
     console.error('Publish error:', error);
     res.status(500).json({ error: 'Failed to publish survey', message: error.message });
@@ -730,17 +653,13 @@ router.post('/:id/unpublish', async (req, res) => {
       return res.status(403).json({ error: 'Admin access required to unpublish' });
     }
 
-    const store = await readStore();
-    const index = store.surveys.findIndex(s => s.surveyId === req.params.id);
+    const survey = await getSurvey(req.params.id);
+    if (!survey) return res.status(404).json({ error: 'Survey not found' });
 
-    if (index === -1) {
-      return res.status(404).json({ error: 'Survey not found' });
-    }
+    survey.publish = { status: 'DRAFT' };
+    await upsertSurvey(survey);
 
-    store.surveys[index].publish = { status: 'DRAFT' };
-    await writeStore(store);
-
-    res.json({ message: 'Survey unpublished', publish: store.surveys[index].publish });
+    res.json({ message: 'Survey unpublished', publish: survey.publish });
   } catch (error) {
     console.error('Unpublish error:', error);
     res.status(500).json({ error: 'Failed to unpublish survey', message: error.message });

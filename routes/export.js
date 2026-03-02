@@ -1,15 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const excelGenerator = require('../services/excelGenerator');
-const { readStore } = require('../data/store');
+const { getSurvey, getQuestions } = require('../data/store');
 
 // GET /api/export/:surveyId - Export survey to Excel
 router.get('/:surveyId', async (req, res) => {
   try {
-    const store = await readStore();
-    
-    // Find survey
-    const survey = store.surveys.find(s => s.surveyId === req.params.surveyId);
+    const survey = await getSurvey(req.params.surveyId);
     if (!survey) {
       return res.status(404).json({ error: 'Survey not found' });
     }
@@ -20,9 +17,9 @@ router.get('/:surveyId', async (req, res) => {
         return res.status(403).json({ error: 'Access denied' });
       }
     }
-    
+
     // Get questions for survey
-    const questions = store.questions.filter(q => q.surveyId === req.params.surveyId);
+    const questions = await getQuestions(req.params.surveyId);
     
     // Generate Excel
     const workbook = await excelGenerator.generateExcel(survey, questions);
