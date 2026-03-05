@@ -3,20 +3,62 @@ const router = express.Router();
 const multer = require('multer');
 const ExcelJS = require('exceljs');
 const { parse } = require('csv-parse/sync');
-const fsp = require('fs').promises;
 const path = require('path');
 const validator = require('../services/validator');
-const { ensureUploadsDir, UPLOAD_DIR, upsertSurvey, upsertQuestion, listSurveys, deleteSurvey } = require('../data/store');
+const { upsertSurvey, upsertQuestion, listSurveys, deleteSurvey } = require('../data/store');
+
+const parsedMaxImportSizeMb = Number(process.env.IMPORT_MAX_FILE_SIZE_MB);
+const MAX_IMPORT_FILE_SIZE_MB = Number.isFinite(parsedMaxImportSizeMb) && parsedMaxImportSizeMb > 0
+  ? parsedMaxImportSizeMb
+  : 10;
+const MAX_IMPORT_FILE_SIZE_BYTES = Math.floor(MAX_IMPORT_FILE_SIZE_MB * 1024 * 1024);
+
+const parsedMaxImportRows = Number(process.env.IMPORT_MAX_ROWS);
+const MAX_IMPORT_ROWS = Number.isFinite(parsedMaxImportRows) && parsedMaxImportRows > 0
+  ? Math.floor(parsedMaxImportRows)
+  : 10000;
+
+const parsedUpsertBatchSize = Number(process.env.IMPORT_UPSERT_BATCH_SIZE);
+const UPSERT_BATCH_SIZE = Number.isFinite(parsedUpsertBatchSize) && parsedUpsertBatchSize > 0
+  ? Math.floor(parsedUpsertBatchSize)
+  : 25;
+
+const ALLOWED_UPLOAD_EXTENSIONS = new Set(['.csv', '.xlsx', '.xls']);
 
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => {
-      ensureUploadsDir()
-        .then(() => cb(null, UPLOAD_DIR))
-        .catch((error) => cb(error));
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_IMPORT_FILE_SIZE_BYTES },
+  fileFilter: (req, file, cb) => {
+    const fileExt = path.extname(file.originalname || '').toLowerCase();
+    if (ALLOWED_UPLOAD_EXTENSIONS.has(fileExt)) {
+      return cb(null, true);
     }
-  })
+    return cb(new Error('Unsupported file format. Please upload XLSX, XLS, or CSV.'));
+  }
 });
+
+function importUploadMiddleware(req, res, next) {
+  upload.single('file')(req, res, (error) => {
+    if (!error) {
+      return next();
+    }
+
+    if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: 'Upload file too large',
+        message: `Maximum supported upload size is ${MAX_IMPORT_FILE_SIZE_MB} MB.`,
+        details: {
+          limitMb: MAX_IMPORT_FILE_SIZE_MB
+        }
+      });
+    }
+
+    return res.status(400).json({
+      error: 'File upload failed',
+      message: error.message || 'Unable to process uploaded file.'
+    });
+  });
+}
 
 // Find a worksheet by name with case-insensitive, trim-aware matching
 function findWorksheet(workbook, name) {
@@ -31,9 +73,9 @@ function findWorksheet(workbook, name) {
 }
 
 // Helper function to parse XLSX file
-async function parseXLSX(filePath) {
+async function parseXLSX(fileBuffer) {
   const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.readFile(filePath);
+  await workbook.xlsx.load(fileBuffer);
 
   const result = { surveys: [], questions: [], diagnostics: { sheetNames: workbook.worksheets.map(s => s.name) } };
 
@@ -154,8 +196,8 @@ function normalizeTextInputType(value) {
 }
 
 // Helper function to parse CSV file
-async function parseCSV(filePath, sheetType) {
-  const fileContent = await fsp.readFile(filePath, 'utf8');
+async function parseCSV(fileBuffer, sheetType) {
+  const fileContent = fileBuffer.toString('utf8');
   const records = parse(fileContent, {
     columns: true,
     skip_empty_lines: true,
@@ -420,24 +462,37 @@ function parseOptions(questionRow) {
   return options;
 }
 
-// POST /api/import - Import survey from XLSX/CSV
-router.post('/', upload.single('file'), async (req, res) => {
-  let filePath = null;
+async function runInBatches(items, batchSize, worker) {
+  for (let index = 0; index < items.length; index += batchSize) {
+    const batch = items.slice(index, index + batchSize);
+    await Promise.all(batch.map((item) => worker(item)));
+  }
+}
 
+// POST /api/import - Import survey from XLSX/CSV
+router.post('/', importUploadMiddleware, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
     const overwrite = String(req.query.overwrite || '').toLowerCase() === 'true';
-    filePath = req.file.path;
-    const fileExt = path.extname(req.file.originalname).toLowerCase();
+    const fileExt = path.extname(req.file.originalname || '').toLowerCase();
+    const fileBuffer = req.file.buffer;
+
+    if (!ALLOWED_UPLOAD_EXTENSIONS.has(fileExt)) {
+      return res.status(400).json({ error: 'Unsupported file format. Please upload XLSX or CSV file.' });
+    }
+
+    if (!fileBuffer || fileBuffer.length === 0) {
+      return res.status(400).json({ error: 'Uploaded file is empty.' });
+    }
 
     let importData;
 
     if (fileExt === '.xlsx' || fileExt === '.xls') {
       try {
-        importData = await parseXLSX(filePath);
+        importData = await parseXLSX(fileBuffer);
       } catch (parseErr) {
         return res.status(400).json({
           error: 'Failed to parse Excel file. The file may be corrupted or in an unsupported format.',
@@ -479,14 +534,24 @@ router.post('/', upload.single('file'), async (req, res) => {
       }
     } else if (fileExt === '.csv') {
       const sheetType = req.query.sheetType || 'both';
-      importData = await parseCSV(filePath, sheetType);
-    } else {
-      return res.status(400).json({ error: 'Unsupported file format. Please upload XLSX or CSV file.' });
+      importData = await parseCSV(fileBuffer, sheetType);
     }
 
     if (fileExt === '.csv' && importData.surveys.length === 0 && importData.questions.length === 0) {
       return res.status(400).json({
         error: 'Could not detect CSV type. Please upload a Survey Master or Question Master CSV.'
+      });
+    }
+
+    const totalImportRows = importData.surveys.length + importData.questions.length;
+    if (totalImportRows > MAX_IMPORT_ROWS) {
+      return res.status(413).json({
+        error: 'Import payload too large',
+        message: `The uploaded file contains ${totalImportRows} rows, which exceeds the ${MAX_IMPORT_ROWS}-row import limit.`,
+        details: {
+          maxRows: MAX_IMPORT_ROWS,
+          totalRows: totalImportRows
+        }
       });
     }
 
@@ -576,17 +641,11 @@ router.post('/', upload.single('file'), async (req, res) => {
     // Import data using targeted upserts (non-destructive)
     if (overwrite) {
       // Delete existing surveys that will be replaced (cascade deletes their questions)
-      for (const surveyId of duplicateSurveyIds) {
-        await deleteSurvey(surveyId);
-      }
+      await runInBatches(duplicateSurveyIds, UPSERT_BATCH_SIZE, (surveyId) => deleteSurvey(surveyId));
     }
 
-    for (const survey of importData.surveys) {
-      await upsertSurvey(survey);
-    }
-    for (const question of importData.questions) {
-      await upsertQuestion(question);
-    }
+    await runInBatches(importData.surveys, UPSERT_BATCH_SIZE, (survey) => upsertSurvey(survey));
+    await runInBatches(importData.questions, UPSERT_BATCH_SIZE, (question) => upsertQuestion(question));
 
     res.status(201).json({
       message: 'Import successful',
@@ -602,15 +661,6 @@ router.post('/', upload.single('file'), async (req, res) => {
       error: 'Failed to import file',
       message: error.message
     });
-  } finally {
-    // Clean up uploaded file
-    if (filePath) {
-      try {
-        await fsp.unlink(filePath);
-      } catch (err) {
-        console.error('Failed to delete uploaded file:', err);
-      }
-    }
   }
 });
 
