@@ -6,7 +6,7 @@ const { parse } = require('csv-parse/sync');
 const fsp = require('fs').promises;
 const path = require('path');
 const validator = require('../services/validator');
-const { readStore, writeStore, ensureUploadsDir, UPLOAD_DIR } = require('../data/store');
+const { ensureUploadsDir, UPLOAD_DIR, upsertSurvey, upsertQuestion, listSurveys, deleteSurvey } = require('../data/store');
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -18,65 +18,86 @@ const upload = multer({
   })
 });
 
+// Find a worksheet by name with case-insensitive, trim-aware matching
+function findWorksheet(workbook, name) {
+  // Try exact match first
+  const exact = workbook.getWorksheet(name);
+  if (exact) return exact;
+  // Fallback: case-insensitive + trimmed match
+  const normalized = name.trim().toLowerCase();
+  return workbook.worksheets.find(
+    s => s.name.trim().toLowerCase() === normalized
+  ) || null;
+}
+
 // Helper function to parse XLSX file
 async function parseXLSX(filePath) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(filePath);
-  
-  const result = { surveys: [], questions: [] };
-  
-  // Parse Survey Master sheet
-  const surveySheet = workbook.getWorksheet('Survey Master');
+
+  const result = { surveys: [], questions: [], diagnostics: { sheetNames: workbook.worksheets.map(s => s.name) } };
+
+  // Parse Survey Master sheet (case-insensitive, trim-aware)
+  const surveySheet = findWorksheet(workbook, 'Survey Master');
   if (surveySheet) {
     const headers = [];
     surveySheet.getRow(1).eachCell((cell, colNumber) => {
       headers[colNumber] = normalizeCellValue(cell.value);
     });
-    
+
     surveySheet.eachRow((row, rowNumber) => {
       if (rowNumber === 1) return; // Skip header
-      
+
+      // Skip completely empty rows
+      let hasData = false;
       const survey = {};
       row.eachCell((cell, colNumber) => {
         const header = headers[colNumber];
         if (header) {
-          // Map column names to field names
           const fieldName = mapSurveyColumnToField(header);
-          survey[fieldName] = normalizeCellValue(cell.value);
+          const value = normalizeCellValue(cell.value);
+          if (value !== null && value !== undefined && value !== '') hasData = true;
+          survey[fieldName] = value;
         }
       });
-      
-      if (survey.surveyId) {
+
+      if (hasData && survey.surveyId) {
+        survey._sourceRow = rowNumber;
         result.surveys.push(survey);
       }
     });
   }
-  
-  // Parse Question Master sheet
-  const questionSheet = workbook.getWorksheet('Question Master');
+
+  // Parse Question Master sheet (case-insensitive, trim-aware)
+  const questionSheet = findWorksheet(workbook, 'Question Master');
   if (questionSheet) {
     const headers = [];
     questionSheet.getRow(1).eachCell((cell, colNumber) => {
       headers[colNumber] = normalizeCellValue(cell.value);
     });
-    
+
     const questionsByKey = {};
-    
+
     questionSheet.eachRow((row, rowNumber) => {
       if (rowNumber === 1) return; // Skip header
-      
+
       const questionRow = {};
+      let hasData = false;
       row.eachCell((cell, colNumber) => {
         const header = headers[colNumber];
         if (header) {
           const fieldName = mapQuestionColumnToField(header);
-          questionRow[fieldName] = normalizeCellValue(cell.value);
+          const value = normalizeCellValue(cell.value);
+          if (value !== null && value !== undefined && value !== '') hasData = true;
+          questionRow[fieldName] = value;
         }
       });
-      
+
+      if (!hasData) return; // Skip empty rows
+
       if (questionRow.surveyId && questionRow.questionId) {
         const key = `${questionRow.surveyId}_${questionRow.questionId}_${questionRow.questionType}`;
-        
+
         if (!questionsByKey[key]) {
           questionsByKey[key] = {
             surveyId: questionRow.surveyId,
@@ -85,19 +106,20 @@ async function parseXLSX(filePath) {
             isDynamic: questionRow.isDynamic,
             isMandatory: questionRow.isMandatory,
             sourceQuestion: questionRow.sourceQuestion || '',
-            textInputType: questionRow.textInputType || 'None',
-            textLimitCharacters: questionRow.textLimitCharacters || '',
-            maxValue: questionRow.maxValue || '',
-            minValue: questionRow.minValue || '',
+            textInputType: normalizeTextInputType(questionRow.textInputType) || 'None',
+            textLimitCharacters: String(questionRow.textLimitCharacters || ''),
+            maxValue: String(questionRow.maxValue || ''),
+            minValue: String(questionRow.minValue || ''),
             tableHeaderValue: questionRow.tableHeaderValue || '',
             tableQuestionValue: questionRow.tableQuestionValue || '',
             questionMediaLink: questionRow.questionMediaLink || '',
             questionMediaType: questionRow.questionMediaType || 'None',
             mode: questionRow.mode || 'None',
-            translations: {}
+            translations: {},
+            _sourceRow: rowNumber
           };
         }
-        
+
         // Add translation for this language
         const language = questionRow.mediumInEnglish || questionRow.medium || 'English';
         questionsByKey[key].translations[language] = {
@@ -109,11 +131,26 @@ async function parseXLSX(filePath) {
         };
       }
     });
-    
+
     result.questions = Object.values(questionsByKey).map(applyPrimaryTranslation);
   }
-  
+
   return result;
+}
+
+// Normalize common text input type typos
+function normalizeTextInputType(value) {
+  if (!value) return value;
+  const normalized = String(value).trim();
+  const map = {
+    'numaric': 'Numeric',
+    'numeric': 'Numeric',
+    'alphanumeric': 'Alphanumeric',
+    'alphabets': 'Alphabets',
+    'text': 'Alphanumeric',
+    'none': 'None'
+  };
+  return map[normalized.toLowerCase()] || normalized;
 }
 
 // Helper function to parse CSV file
@@ -274,7 +311,22 @@ function normalizeCellValue(value) {
     const day = String(value.getDate()).padStart(2, '0');
     const month = String(value.getMonth() + 1).padStart(2, '0');
     const year = value.getFullYear();
+    const hours = value.getHours();
+    const minutes = value.getMinutes();
+    const seconds = value.getSeconds();
+    // Include time component if non-zero
+    if (hours || minutes || seconds) {
+      return `${day}/${month}/${year} ${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
     return `${day}/${month}/${year}`;
+  }
+
+  if (typeof value === 'number') {
+    return String(value);
+  }
+
+  if (typeof value === 'boolean') {
+    return value ? 'Yes' : 'No';
   }
 
   if (typeof value === 'string') {
@@ -282,16 +334,16 @@ function normalizeCellValue(value) {
   }
 
   if (typeof value === 'object') {
-    if (value.text) return value.text;
+    if (value.text) return String(value.text).trim();
     if (value.richText) {
-      return value.richText.map((part) => part.text).join('');
+      return value.richText.map((part) => part.text).join('').trim();
     }
-    if (value.result !== undefined) return value.result;
-    if (value.formula && value.result !== undefined) return value.result;
-    if (value.hyperlink) return value.text || value.hyperlink;
+    if (value.result !== undefined) return normalizeCellValue(value.result);
+    if (value.formula && value.result !== undefined) return normalizeCellValue(value.result);
+    if (value.hyperlink) return String(value.text || value.hyperlink).trim();
   }
 
-  return value;
+  return String(value);
 }
 
 function normalizeHeaderKey(value) {
@@ -371,26 +423,57 @@ function parseOptions(questionRow) {
 // POST /api/import - Import survey from XLSX/CSV
 router.post('/', upload.single('file'), async (req, res) => {
   let filePath = null;
-  
+
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
-    
+
     const overwrite = String(req.query.overwrite || '').toLowerCase() === 'true';
     filePath = req.file.path;
     const fileExt = path.extname(req.file.originalname).toLowerCase();
-    
+
     let importData;
-    
+
     if (fileExt === '.xlsx' || fileExt === '.xls') {
-      importData = await parseXLSX(filePath);
-      if (importData.surveys.length === 0 || importData.questions.length === 0) {
+      try {
+        importData = await parseXLSX(filePath);
+      } catch (parseErr) {
         return res.status(400).json({
-          error: 'Survey Master and Question Master sheets are required for Excel imports.',
+          error: 'Failed to parse Excel file. The file may be corrupted or in an unsupported format.',
+          message: parseErr.message
+        });
+      }
+
+      if (importData.surveys.length === 0 && importData.questions.length === 0) {
+        return res.status(400).json({
+          error: 'No data found. Ensure the file has "Survey Master" and "Question Master" sheets.',
           details: {
-            hasSurveyMaster: importData.surveys.length > 0,
+            sheetsFound: importData.diagnostics?.sheetNames || [],
+            hasSurveyMaster: false,
+            hasQuestionMaster: false
+          }
+        });
+      }
+
+      // Allow import with only surveys or only questions (e.g., adding questions to existing surveys)
+      if (importData.surveys.length === 0) {
+        return res.status(400).json({
+          error: 'No "Survey Master" sheet found. Excel imports require both Survey Master and Question Master sheets.',
+          details: {
+            sheetsFound: importData.diagnostics?.sheetNames || [],
+            hasSurveyMaster: false,
             hasQuestionMaster: importData.questions.length > 0
+          }
+        });
+      }
+      if (importData.questions.length === 0) {
+        return res.status(400).json({
+          error: 'No "Question Master" sheet found. Excel imports require both Survey Master and Question Master sheets.',
+          details: {
+            sheetsFound: importData.diagnostics?.sheetNames || [],
+            hasSurveyMaster: importData.surveys.length > 0,
+            hasQuestionMaster: false
           }
         });
       }
@@ -400,18 +483,17 @@ router.post('/', upload.single('file'), async (req, res) => {
     } else {
       return res.status(400).json({ error: 'Unsupported file format. Please upload XLSX or CSV file.' });
     }
-    
+
     if (fileExt === '.csv' && importData.surveys.length === 0 && importData.questions.length === 0) {
       return res.status(400).json({
         error: 'Could not detect CSV type. Please upload a Survey Master or Question Master CSV.'
       });
     }
 
-    // Validate imported data
-    const errors = [];
-    const store = await readStore();
+    // Check for duplicate survey IDs
+    const existingSurveys = await listSurveys();
     const incomingSurveyIds = new Set(importData.surveys.map((survey) => survey.surveyId));
-    const duplicateSurveyIds = store.surveys
+    const duplicateSurveyIds = existingSurveys
       .filter((survey) => incomingSurveyIds.has(survey.surveyId))
       .map((survey) => survey.surveyId);
 
@@ -435,50 +517,39 @@ router.post('/', upload.single('file'), async (req, res) => {
       });
     }
 
-    if (duplicateSurveyIds.length > 0 && overwrite) {
-      store.surveys = store.surveys.filter((survey) => !incomingSurveyIds.has(survey.surveyId));
-      store.questions = store.questions.filter((question) => !incomingSurveyIds.has(question.surveyId));
-    }
+    // Build validation context
+    const otherSurveys = overwrite
+      ? existingSurveys.filter(s => !incomingSurveyIds.has(s.surveyId))
+      : existingSurveys;
+    const surveysForValidation = [...otherSurveys, ...importData.surveys];
 
-    const surveysForValidation = [...store.surveys, ...importData.surveys];
-    const questionsForValidation = [...store.questions, ...importData.questions];
-    
     // Validate surveys
+    const errors = [];
     importData.surveys.forEach((survey, index) => {
       const validation = validator.validateSurvey(survey);
       if (!validation.isValid) {
         errors.push({
           type: 'survey',
-          index: index + 1,
-          surveyId: survey.surveyId,
+          index: survey._sourceRow || (index + 2),
+          surveyId: survey.surveyId || `(Row ${index + 2})`,
           errors: validation.errors
         });
       }
-      
-      // Check for duplicate survey IDs when overwrite is not enabled
-      if (!overwrite && store.surveys.find(s => s.surveyId === survey.surveyId)) {
-        errors.push({
-          type: 'survey',
-          index: index + 1,
-          surveyId: survey.surveyId,
-          errors: ['Survey ID already exists in the system']
-        });
-      }
     });
-    
+
     // Validate questions
     importData.questions.forEach((question, index) => {
-      const validation = validator.validateQuestion(question, surveysForValidation, questionsForValidation);
+      const validation = validator.validateQuestion(question, surveysForValidation, importData.questions);
       if (!validation.isValid) {
         errors.push({
           type: 'question',
-          index: index + 1,
-          questionId: question.questionId,
+          index: question._sourceRow || (index + 2),
+          questionId: question.questionId || `(Row ${index + 2})`,
           errors: validation.errors
         });
       }
     });
-    
+
     if (errors.length > 0) {
       return res.status(400).json({
         error: 'Validation failed',
@@ -487,7 +558,7 @@ router.post('/', upload.single('file'), async (req, res) => {
         questionsCount: importData.questions.length
       });
     }
-    
+
     // Auto-set stateCode for non-admin users
     if (req.user && req.user.role !== 'admin' && req.user.stateCode) {
       importData.surveys.forEach(s => { s.stateCode = req.user.stateCode; });
@@ -498,11 +569,25 @@ router.post('/', upload.single('file'), async (req, res) => {
       if (!s.publish) s.publish = { status: 'DRAFT' };
     });
 
-    // Import data to store
-    store.surveys.push(...importData.surveys);
-    store.questions.push(...importData.questions);
-    await writeStore(store);
-    
+    // Clean internal fields before persisting
+    importData.surveys.forEach(s => { delete s._sourceRow; });
+    importData.questions.forEach(q => { delete q._sourceRow; });
+
+    // Import data using targeted upserts (non-destructive)
+    if (overwrite) {
+      // Delete existing surveys that will be replaced (cascade deletes their questions)
+      for (const surveyId of duplicateSurveyIds) {
+        await deleteSurvey(surveyId);
+      }
+    }
+
+    for (const survey of importData.surveys) {
+      await upsertSurvey(survey);
+    }
+    for (const question of importData.questions) {
+      await upsertQuestion(question);
+    }
+
     res.status(201).json({
       message: 'Import successful',
       overwrite,
@@ -510,7 +595,7 @@ router.post('/', upload.single('file'), async (req, res) => {
       questionsImported: importData.questions.length,
       surveys: importData.surveys
     });
-    
+
   } catch (error) {
     console.error('Import error:', error);
     res.status(500).json({

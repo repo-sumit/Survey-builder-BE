@@ -56,9 +56,9 @@ class ValidationEngine {
         message: 'Survey Name is required and must not exceed 99 characters'
       },
       surveyDescription: {
-        type: 'required',
+        type: 'optional',
         maxLength: 256,
-        message: 'Survey Description is required and must not exceed 256 characters'
+        message: 'Survey Description must not exceed 256 characters'
       },
       availableMediums: {
         type: 'required',
@@ -367,24 +367,28 @@ class ValidationEngine {
       return errors;
     }
 
-    // Pattern validation
+    // Pattern validation — coerce to string for Excel numeric cells
     if (rule.pattern && value) {
-      if (!rule.pattern.test(value)) {
+      const strValue = String(value).trim();
+      if (!rule.pattern.test(strValue)) {
         errors.push({
           field,
           message: rule.message,
-          value
+          value: strValue
         });
       }
     }
 
-    // Max length validation
-    if (rule.maxLength && value && value.length > rule.maxLength) {
-      errors.push({
-        field,
-        message: `${field} must not exceed ${rule.maxLength} characters`,
-        value
-      });
+    // Max length validation — coerce to string
+    if (rule.maxLength && value) {
+      const strValue = String(value);
+      if (strValue.length > rule.maxLength) {
+        errors.push({
+          field,
+          message: `${field} must not exceed ${rule.maxLength} characters`,
+          value: strValue
+        });
+      }
     }
 
     // Enum validation
@@ -406,22 +410,25 @@ class ValidationEngine {
       }
     }
 
-    // Simple enum values (not array)
-    if (rule.values && value && !rule.values.includes(value)) {
-      errors.push({
-        field,
-        message: rule.message,
-        value
-      });
-    }
-
-    // Date format validation
-    if (rule.type === 'dateFormat' && value) {
-      if (!this._isValidDateFormat(value)) {
+    // Simple enum values (not array) — coerce to string for Excel numeric/boolean cells
+    if (rule.values && value) {
+      const strValue = String(value).trim();
+      if (!rule.values.includes(strValue)) {
         errors.push({
           field,
           message: rule.message,
-          value
+          value: strValue
+        });
+      }
+    }
+
+    // Date format validation — coerce to string
+    if (rule.type === 'dateFormat' && value) {
+      if (!this._isValidDateFormat(String(value).trim())) {
+        errors.push({
+          field,
+          message: rule.message,
+          value: String(value)
         });
       }
     }
@@ -493,13 +500,14 @@ class ValidationEngine {
             value: questionData.options.length
           });
         }
-        // Each option max 100 chars
+        // Each option max 100 chars — options can be strings or {text, textInEnglish} objects
         questionData.options.forEach((opt, idx) => {
-          if (opt && opt.length > 100) {
+          const optText = typeof opt === 'object' ? (opt.text || '') : String(opt || '');
+          if (optText && optText.length > 100) {
             errors.push({
               field: 'options',
               message: `Option ${idx + 1} exceeds 100 characters`,
-              value: opt
+              value: optText
             });
           }
         });
@@ -597,7 +605,7 @@ class ValidationEngine {
     } else if (typeof value === 'string') {
       rawValues = value.split(',');
     } else if (value !== undefined && value !== null) {
-      rawValues = [value];
+      rawValues = [String(value)];
     }
 
     const values = [];
@@ -711,10 +719,14 @@ class ValidationEngine {
    * Validate hierarchy level format
    */
   _validateHierarchyLevel(value) {
-    if (!value) return null;
+    if (value === null || value === undefined || value === '') return null;
 
-    const levels = value.split(',').map(l => l.trim()).filter(l => l);
-    
+    // Coerce to string to handle numeric cell values from Excel
+    const strValue = String(value).trim();
+    if (!strValue) return null;
+
+    const levels = strValue.split(',').map(l => l.trim()).filter(l => l);
+
     // Check all are numeric
     for (const level of levels) {
       if (!/^\d+$/.test(level)) {
@@ -741,27 +753,27 @@ class ValidationEngine {
   _isValidDateFormat(dateString) {
     if (!dateString) return false;
 
-    // Try DD/MM/YYYY HH:MM:SS format
-    const regex1 = /^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}$/;
-    // Try DD/MM/YYYY format
-    const regex2 = /^\d{2}\/\d{2}\/\d{4}$/;
-    
-    if (!regex1.test(dateString) && !regex2.test(dateString)) {
-      return false;
-    }
+    const str = String(dateString).trim();
 
-    // Validate actual date values
-    const datePart = dateString.split(' ')[0];
-    const [day, month, year] = datePart.split('/').map(Number);
-    
+    // Accept D/M/YYYY or DD/MM/YYYY with optional HH:MM:SS time
+    const regex = /^(\d{1,2})\/(\d{1,2})\/(\d{4})(?: (\d{1,2}):(\d{1,2}):(\d{1,2}))?$/;
+    const match = str.match(regex);
+    if (!match) return false;
+
+    const [, dayStr, monthStr, yearStr, hoursStr, minutesStr, secondsStr] = match;
+    const day = Number(dayStr);
+    const month = Number(monthStr);
+    const year = Number(yearStr);
+
     if (month < 1 || month > 12) return false;
     if (day < 1 || day > 31) return false;
     if (year < 1900) return false;
 
     // If time part exists, validate it
-    if (dateString.includes(' ')) {
-      const timePart = dateString.split(' ')[1];
-      const [hours, minutes, seconds] = timePart.split(':').map(Number);
+    if (hoursStr !== undefined) {
+      const hours = Number(hoursStr);
+      const minutes = Number(minutesStr);
+      const seconds = Number(secondsStr);
       if (hours < 0 || hours > 23) return false;
       if (minutes < 0 || minutes > 59) return false;
       if (seconds < 0 || seconds > 59) return false;
@@ -774,12 +786,13 @@ class ValidationEngine {
    * Parse date string DD/MM/YYYY HH:MM:SS to Date object
    */
   _parseDateString(dateString) {
-    const [datePart, timePart] = dateString.split(' ');
-    const [day, month, year] = datePart.split('/').map(Number);
-    
-    if (timePart) {
-      const [hours, minutes, seconds] = timePart.split(':').map(Number);
-      return new Date(year, month - 1, day, hours, minutes, seconds);
+    const str = String(dateString).trim();
+    const parts = str.split(' ');
+    const [day, month, year] = parts[0].split('/').map(Number);
+
+    if (parts[1]) {
+      const [hours, minutes, seconds] = parts[1].split(':').map(Number);
+      return new Date(year, month - 1, day, hours || 0, minutes || 0, seconds || 0);
     } else {
       return new Date(year, month - 1, day);
     }
