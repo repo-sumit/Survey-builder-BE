@@ -146,7 +146,9 @@ class ExcelGenerator {
   
   buildQuestionRow(question, language, translationData, surveyId) {
     const nativeScript = this.getNativeScript(language);
-    
+    const TABULAR_TYPES = ['Tabular Text Input', 'Tabular Drop Down', 'Tabular Check Box'];
+    const isTabular = TABULAR_TYPES.includes(question.questionType);
+
     const row = {
       surveyId: surveyId || question.surveyId || '',
       medium: nativeScript,
@@ -158,8 +160,8 @@ class ExcelGenerator {
       maxValue: question.maxValue || '',
       minValue: question.minValue || '',
       isMandatory: question.isMandatory || 'No',
-      tableHeaderValue: translationData.tableHeaderValue || question.tableHeaderValue || '',
-      tableQuestionValue: translationData.tableQuestionValue || question.tableQuestionValue || '',
+      tableHeaderValue: isTabular ? (translationData.tableHeaderValue || question.tableHeaderValue || '') : '',
+      tableQuestionValue: isTabular ? (translationData.tableQuestionValue || question.tableQuestionValue || '') : '',
       sourceQuestion: question.sourceQuestion || '',
       textInputType: question.textInputType || 'None',
       textLimitCharacters: question.textLimitCharacters || '',
