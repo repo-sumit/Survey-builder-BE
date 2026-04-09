@@ -22,11 +22,39 @@ const accessSheetRouter = require('./routes/accessSheet');
 const app = express();
 const PORT = process.env.PORT || 5001;
 
+// Lazy DB initialization (required for Vercel serverless cold starts)
+let dbReady = false;
+let dbInitPromise = null;
+
+function ensureDB() {
+  if (dbReady) return Promise.resolve();
+  if (!dbInitPromise) {
+    dbInitPromise = initStore()
+      .then(() => { dbReady = true; })
+      .catch(err => {
+        dbInitPromise = null; // allow retry on next request
+        throw err;
+      });
+  }
+  return dbInitPromise;
+}
+
 // Middleware
 app.use(compression());  // gzip all responses — major speed boost
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+
+// DB init middleware — runs once on first request, then becomes a no-op
+app.use(async (req, res, next) => {
+  try {
+    await ensureDB();
+    next();
+  } catch (err) {
+    console.error('Database initialization failed:', err);
+    res.status(503).json({ error: 'Database unavailable', message: err.message });
+  }
+});
 
 // Public routes (no auth)
 app.get('/api/health', (req, res) => {
@@ -45,8 +73,8 @@ app.use('/api/admin', requireAuth, requireAdmin, adminRouter);
 app.use('/api/designations', requireAuth, designationsRouter);
 app.use('/api/access-sheet', requireAuth, accessSheetRouter);
 
-// Serve static files from React app in production
-if (process.env.NODE_ENV === 'production') {
+// Serve static files from React app in production (non-Vercel)
+if (process.env.NODE_ENV === 'production' && !process.env.VERCEL) {
   app.use(express.static(path.join(__dirname, '../client/build')));
 
   app.get('*', (req, res) => {
@@ -60,17 +88,19 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Something went wrong!', message: err.message });
 });
 
-// Initialize DB then start server
-initStore()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`Server is running on port ${PORT}`);
-      console.log(`API available at http://localhost:${PORT}/api`);
+// Start server only when running directly (not on Vercel serverless)
+if (!process.env.VERCEL) {
+  initStore()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`Server is running on port ${PORT}`);
+        console.log(`API available at http://localhost:${PORT}/api`);
+      });
+    })
+    .catch(err => {
+      console.error('Failed to initialize database:', err);
+      process.exit(1);
     });
-  })
-  .catch(err => {
-    console.error('Failed to initialize database:', err);
-    process.exit(1);
-  });
+}
 
 module.exports = app;

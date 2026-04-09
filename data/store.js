@@ -3,7 +3,9 @@ const fsp = fs.promises;
 const path = require('path');
 const { pool, initDB } = require('./db');
 
-const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
+const UPLOAD_DIR = process.env.VERCEL
+  ? path.join('/tmp', 'uploads')
+  : path.join(__dirname, '..', 'uploads');
 const STORE_PATH = path.join(__dirname, 'store.json'); // kept for migration reference
 
 async function initStore() {
