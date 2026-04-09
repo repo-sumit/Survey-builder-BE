@@ -8,13 +8,15 @@ const isCloudDB = /supabase\.com|neon\.tech|railway\.app|render\.com|cockroachla
   || process.env.NODE_ENV === 'production'
   || process.env.DB_SSL === 'true';
 
+const isVercel = !!process.env.VERCEL;
+
 const pool = new Pool({
   connectionString: dbUrl,
   ssl: isCloudDB ? { rejectUnauthorized: false } : false,
-  // Pool tuning for performance
-  max: 10,                   // max 10 connections (default 10, explicit for clarity)
-  idleTimeoutMillis: 30000,  // close idle connections after 30s
-  connectionTimeoutMillis: 5000, // fail fast if DB is unreachable
+  // Serverless: fewer connections, shorter idle (each function is isolated)
+  max: isVercel ? 2 : 10,
+  idleTimeoutMillis: isVercel ? 10000 : 30000,
+  connectionTimeoutMillis: 5000,
 });
 
 async function initDB() {

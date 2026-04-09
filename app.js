@@ -60,6 +60,18 @@ app.use(async (req, res, next) => {
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', message: 'FMB Survey Builder API is running' });
 });
+
+// Keep-alive endpoint — pings DB to prevent Supabase free-tier pause
+app.get('/api/keep-alive', async (req, res) => {
+  try {
+    const { pool } = require('./data/db');
+    const result = await pool.query('SELECT NOW()');
+    res.json({ status: 'ok', db: 'alive', time: result.rows[0].now });
+  } catch (err) {
+    console.error('Keep-alive DB ping failed:', err.message);
+    res.status(503).json({ status: 'error', db: 'unreachable', message: err.message });
+  }
+});
 app.use('/api/auth', authRouter);
 
 // Protected routes (auth required)
