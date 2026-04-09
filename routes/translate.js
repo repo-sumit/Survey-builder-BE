@@ -75,55 +75,59 @@ router.post('/', (req, res) => {
     res.json({ translatedText });
   };
 
-  const request = transport.request(
-    {
-      hostname: url.hostname,
-      port: url.port || (url.protocol === 'https:' ? 443 : 80),
-      path: `${url.pathname}${url.search}`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body)
+  try {
+    const request = transport.request(
+      {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: `${url.pathname}${url.search}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body)
+        }
+      },
+      (response) => {
+        let data = '';
+        response.on('data', (chunk) => {
+          data += chunk;
+        });
+        response.on('end', () => {
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            console.error('Upstream translation error:', data);
+            return finalizeError(502, 'Upstream translation service returned a non-success status', [
+              { upstreamStatus: response.statusCode }
+            ]);
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            const translatedText = parsed.translatedText || parsed.translation || '';
+            return finalizeSuccess(translatedText);
+          } catch (error) {
+            console.error('Upstream translation response not valid JSON:', data);
+            return finalizeError(
+              502,
+              'Upstream translation response was not valid JSON'
+            );
+          }
+        });
       }
-    },
-    (response) => {
-      let data = '';
-      response.on('data', (chunk) => {
-        data += chunk;
-      });
-      response.on('end', () => {
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          return finalizeError(502, 'Upstream translation service returned a non-success status', [
-            { upstreamStatus: response.statusCode },
-            { upstreamBody: data }
-          ]);
-        }
+    );
 
-        try {
-          const parsed = JSON.parse(data);
-          const translatedText = parsed.translatedText || parsed.translation || '';
-          return finalizeSuccess(translatedText);
-        } catch (error) {
-          return finalizeError(
-            502,
-            'Upstream translation response was not valid JSON',
-            [{ upstreamBody: data }]
-          );
-        }
-      });
-    }
-  );
+    request.setTimeout(timeoutMs, () => {
+      request.destroy(new Error(`Translation request timed out after ${timeoutMs}ms`));
+    });
 
-  request.setTimeout(timeoutMs, () => {
-    request.destroy(new Error(`Translation request timed out after ${timeoutMs}ms`));
-  });
+    request.on('error', (error) => {
+      finalizeError(502, error.message, [{ code: error.code || 'UNKNOWN' }]);
+    });
 
-  request.on('error', (error) => {
-    finalizeError(502, error.message, [{ code: error.code || 'UNKNOWN' }]);
-  });
-
-  request.write(body);
-  request.end();
+    request.write(body);
+    request.end();
+  } catch (error) {
+    finalizeError(500, 'Failed to initiate translation request', [{ code: error.code || 'UNKNOWN' }]);
+  }
 });
 
 module.exports = router;

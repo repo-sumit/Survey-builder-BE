@@ -43,7 +43,9 @@ router.get('/:surveyId', async (req, res) => {
     res.end();
   } catch (error) {
     console.error('Export error:', error);
-    res.status(500).json({ error: 'Failed to export survey', message: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to export survey', message: error.message });
+    }
   }
 });
 
