@@ -54,6 +54,16 @@ async function listSurveys(stateCode) {
   });
 }
 
+/** Check which survey IDs from a list already exist. Returns array of existing IDs. */
+async function findExistingSurveyIds(surveyIds) {
+  if (!surveyIds || surveyIds.length === 0) return [];
+  const { rows } = await pool.query(
+    'SELECT survey_id FROM surveys WHERE survey_id = ANY($1)',
+    [surveyIds]
+  );
+  return rows.map(r => r.survey_id);
+}
+
 /** Get a single survey by ID. Returns null if not found. */
 async function getSurvey(surveyId) {
   const { rows } = await pool.query(
@@ -179,6 +189,7 @@ module.exports = {
   ensureUploadsDir,
   // Targeted queries (performance)
   listSurveys,
+  findExistingSurveyIds,
   getSurvey,
   getQuestions,
   getQuestion,

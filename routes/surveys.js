@@ -309,11 +309,11 @@ router.post('/:id/questions', requireWriteAccess, async (req, res) => {
       });
     }
 
-    // Fetch surveys + questions for this survey only (for validator)
-    const surveys = await listSurveys();
+    // Fetch only the current survey + its questions (not all surveys)
+    const currentSurvey = await getSurvey(req.params.id);
     const questions = await getQuestions(req.params.id);
 
-    const validation = validator.validateQuestion(questionData, surveys, questions);
+    const validation = validator.validateQuestion(questionData, currentSurvey ? [currentSurvey] : [], questions);
     if (!validation.isValid) {
       return res.status(400).json({
         error: 'Validation failed',
@@ -366,10 +366,10 @@ router.put('/:id/questions/:questionId', requireWriteAccess, async (req, res) =>
       return res.status(409).json({ error: `Survey is locked by ${lock.lockedBy}` });
     }
 
-    const surveys = await listSurveys();
+    const currentSurvey = await getSurvey(req.params.id);
     const questions = await getQuestions(req.params.id);
 
-    const validation = validator.validateQuestion(questionData, surveys, questions);
+    const validation = validator.validateQuestion(questionData, currentSurvey ? [currentSurvey] : [], questions);
     if (!validation.isValid) {
       return res.status(400).json({
         error: 'Validation failed',
@@ -534,10 +534,10 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
       });
     }
 
-    const surveys = await listSurveys();
+    const currentSurvey = await getSurvey(surveyId);
     const questions = await getQuestions(surveyId);
 
-    const validation = validator.validateQuestion(duplicatedQuestion, surveys, questions);
+    const validation = validator.validateQuestion(duplicatedQuestion, currentSurvey ? [currentSurvey] : [], questions);
     if (!validation.isValid) {
       return res.status(400).json({ errors: validation.errors });
     }

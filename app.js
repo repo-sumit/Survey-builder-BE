@@ -97,7 +97,13 @@ if (process.env.NODE_ENV === 'production' && !process.env.VERCEL) {
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  res.status(500).json({ error: 'Something went wrong!', message: err.message });
+  if (res.headersSent) return next(err);
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({
+    error: err.type || 'Internal server error',
+    message: err.message || 'Something went wrong',
+    errors: err.errors || [err.message || 'Something went wrong']
+  });
 });
 
 // Start server only when running directly (not on Vercel serverless)

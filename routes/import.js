@@ -5,7 +5,7 @@ const ExcelJS = require('exceljs');
 const { parse } = require('csv-parse/sync');
 const path = require('path');
 const validator = require('../services/validator');
-const { upsertSurvey, upsertQuestion, listSurveys, deleteSurvey } = require('../data/store');
+const { upsertSurvey, upsertQuestion, findExistingSurveyIds, deleteSurvey } = require('../data/store');
 
 const parsedMaxImportSizeMb = Number(process.env.IMPORT_MAX_FILE_SIZE_MB);
 const MAX_IMPORT_FILE_SIZE_MB = Number.isFinite(parsedMaxImportSizeMb) && parsedMaxImportSizeMb > 0
@@ -555,12 +555,9 @@ router.post('/', importUploadMiddleware, async (req, res) => {
       });
     }
 
-    // Check for duplicate survey IDs
-    const existingSurveys = await listSurveys();
-    const incomingSurveyIds = new Set(importData.surveys.map((survey) => survey.surveyId));
-    const duplicateSurveyIds = existingSurveys
-      .filter((survey) => incomingSurveyIds.has(survey.surveyId))
-      .map((survey) => survey.surveyId);
+    // Check for duplicate survey IDs (targeted query instead of loading all surveys)
+    const incomingSurveyIds = importData.surveys.map((survey) => survey.surveyId);
+    const duplicateSurveyIds = await findExistingSurveyIds(incomingSurveyIds);
 
     if (duplicateSurveyIds.length > 0 && !overwrite) {
       return res.status(400).json({
