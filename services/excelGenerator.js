@@ -57,6 +57,18 @@ class ExcelGenerator {
 
     sheet.columns = columns;
 
+    // Ensure dates always include time component
+    const normalizeLaunchDate = (d) => {
+      if (!d) return '';
+      const datePart = d.split(' ')[0];
+      return `${datePart} 00:00:00`;
+    };
+    const normalizeCloseDate = (d) => {
+      if (!d) return '';
+      const datePart = d.split(' ')[0];
+      return `${datePart} 23:59:59`;
+    };
+
     // Add survey data
     sheet.addRow({
       surveyId: survey.surveyId || '',
@@ -67,8 +79,8 @@ class ExcelGenerator {
       public: survey.public || 'No',
       inSchool: survey.inSchool || 'No',
       acceptMultipleEntries: survey.acceptMultipleEntries || 'No',
-      launchDate: survey.launchDate || '',
-      closeDate: survey.closeDate || '',
+      launchDate: normalizeLaunchDate(survey.launchDate),
+      closeDate: normalizeCloseDate(survey.closeDate),
       mode: survey.mode || 'None',
       visibleOnReportBot: survey.visibleOnReportBot || 'No',
       isActive: survey.isActive || 'No',
