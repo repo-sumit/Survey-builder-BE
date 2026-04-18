@@ -518,11 +518,26 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
       newQuestionId = `Q${maxQuestionNum + 1}`;
     }
 
+    // Strip child-question references from options so the duplicate doesn't
+    // collide with the original's children during validation
+    const clearOptionChildren = (opts) => {
+      if (!Array.isArray(opts)) return opts;
+      return opts.map(opt => (opt && typeof opt === 'object') ? { ...opt, children: '' } : opt);
+    };
+
+    const clonedTranslations = {};
+    if (originalQuestion.translations && typeof originalQuestion.translations === 'object') {
+      for (const [lang, t] of Object.entries(originalQuestion.translations)) {
+        clonedTranslations[lang] = { ...t, options: clearOptionChildren(t?.options) };
+      }
+    }
+
     const duplicatedQuestion = {
       ...originalQuestion,
       questionId: newQuestionId,
       sourceQuestion: '',
-      optionChildren: originalQuestion.optionChildren || ''
+      options: clearOptionChildren(originalQuestion.options),
+      translations: clonedTranslations
     };
 
     const existingQ = await getQuestion(surveyId, newQuestionId);
@@ -539,12 +554,18 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
 
     const validation = validator.validateQuestion(duplicatedQuestion, currentSurvey ? [currentSurvey] : [], questions);
     if (!validation.isValid) {
-      return res.status(400).json({ errors: validation.errors });
+      const errorMessages = validation.errors.map(e => typeof e === 'string' ? e : e.message).filter(Boolean);
+      return res.status(400).json({
+        error: errorMessages[0] || 'Validation failed',
+        message: errorMessages.join(' | '),
+        errors: errorMessages
+      });
     }
 
     await upsertQuestion(duplicatedQuestion);
     res.status(201).json(duplicatedQuestion);
   } catch (error) {
+    console.error('Duplicate question error:', error);
     res.status(500).json({ error: 'Failed to duplicate question', message: error.message });
   }
 });
