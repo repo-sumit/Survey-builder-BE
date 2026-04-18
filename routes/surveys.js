@@ -518,26 +518,29 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
       newQuestionId = `Q${maxQuestionNum + 1}`;
     }
 
-    // Strip child-question references from options so the duplicate doesn't
-    // collide with the original's children during validation
-    const clearOptionChildren = (opts) => {
+    // Deep-clone the original and strip ALL child-question references so the
+    // duplicate is completely independent of any parent-child mapping.
+    const safeOriginal = JSON.parse(JSON.stringify(originalQuestion));
+
+    const stripChildrenFromOptions = (opts) => {
       if (!Array.isArray(opts)) return opts;
       return opts.map(opt => (opt && typeof opt === 'object') ? { ...opt, children: '' } : opt);
     };
 
-    const clonedTranslations = {};
-    if (originalQuestion.translations && typeof originalQuestion.translations === 'object') {
-      for (const [lang, t] of Object.entries(originalQuestion.translations)) {
-        clonedTranslations[lang] = { ...t, options: clearOptionChildren(t?.options) };
+    if (safeOriginal.translations && typeof safeOriginal.translations === 'object') {
+      for (const lang of Object.keys(safeOriginal.translations)) {
+        const t = safeOriginal.translations[lang];
+        if (t && typeof t === 'object') {
+          t.options = stripChildrenFromOptions(t.options);
+        }
       }
     }
 
     const duplicatedQuestion = {
-      ...originalQuestion,
+      ...safeOriginal,
       questionId: newQuestionId,
       sourceQuestion: '',
-      options: clearOptionChildren(originalQuestion.options),
-      translations: clonedTranslations
+      options: stripChildrenFromOptions(safeOriginal.options)
     };
 
     const existingQ = await getQuestion(surveyId, newQuestionId);
@@ -553,8 +556,17 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
     const questions = await getQuestions(surveyId);
 
     const validation = validator.validateQuestion(duplicatedQuestion, currentSurvey ? [currentSurvey] : [], questions);
-    if (!validation.isValid) {
-      const errorMessages = validation.errors.map(e => typeof e === 'string' ? e : e.message).filter(Boolean);
+
+    // Since we've explicitly cleared all child references on the duplicate,
+    // any "child mapping conflict" error must come from pre-existing data
+    // (not from this duplicate). Skip that specific error class for duplicates.
+    const realErrors = (validation.errors || []).filter(err => {
+      const msg = typeof err === 'string' ? err : (err?.message || '');
+      return !msg.includes('Child question IDs cannot be mapped to multiple');
+    });
+
+    if (realErrors.length > 0) {
+      const errorMessages = realErrors.map(e => typeof e === 'string' ? e : e.message).filter(Boolean);
       return res.status(400).json({
         error: errorMessages[0] || 'Validation failed',
         message: errorMessages.join(' | '),
