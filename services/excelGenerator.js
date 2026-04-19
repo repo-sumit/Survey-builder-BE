@@ -14,6 +14,27 @@ const LANGUAGE_MAPPINGS = {
   'Punjabi': 'ਪੰਜਾਬੀ'
 };
 
+// Sort question IDs hierarchically: Q1, Q1.1, Q1.2, Q1.2.1, Q2, Q2.1, ...
+function sortQuestionsHierarchically(questions) {
+  const parseSegments = (questionId) => {
+    const cleaned = String(questionId || '').replace(/^Q/i, '');
+    return cleaned.split('.').map(p => Number.parseInt(p, 10)).filter(n => !Number.isNaN(n));
+  };
+  return [...questions].sort((a, b) => {
+    const aParts = parseSegments(a.questionId);
+    const bParts = parseSegments(b.questionId);
+    const maxLen = Math.max(aParts.length, bParts.length);
+    for (let i = 0; i < maxLen; i += 1) {
+      const aVal = aParts[i];
+      const bVal = bParts[i];
+      if (aVal === undefined) return -1;
+      if (bVal === undefined) return 1;
+      if (aVal !== bVal) return aVal - bVal;
+    }
+    return 0;
+  });
+}
+
 class ExcelGenerator {
   async generateExcel(survey, questions) {
     const workbook = new ExcelJS.Workbook();
@@ -134,8 +155,11 @@ class ExcelGenerator {
           : survey.availableMediums)
       : ['English'];
 
+    // Sort questions hierarchically (Q1, Q1.1, Q1.2, Q2, Q2.1, ...)
+    const sortedQuestions = sortQuestionsHierarchically(questions);
+
     // Add question data with multi-language duplication
-    questions.forEach(question => {
+    sortedQuestions.forEach(question => {
       // If question has translations, use them; otherwise duplicate for each survey language
       if (question.translations && Object.keys(question.translations).length > 0) {
         // New format: question with translations object
