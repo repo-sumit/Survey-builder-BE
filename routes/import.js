@@ -72,6 +72,17 @@ function findWorksheet(workbook, name) {
   ) || null;
 }
 
+// Convert column number (1-based) to Excel letter (A, B, ..., Z, AA, AB, ...)
+function colNumToLetter(n) {
+  let s = '';
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
 // Helper function to parse XLSX file
 async function parseXLSX(fileBuffer) {
   const workbook = new ExcelJS.Workbook();
@@ -82,8 +93,8 @@ async function parseXLSX(fileBuffer) {
     questions: [],
     diagnostics: {
       sheetNames: workbook.worksheets.map(s => s.name),
-      surveySheet: { found: false, headers: [], rowCount: 0, skippedRows: 0 },
-      questionSheet: { found: false, headers: [], rowCount: 0, skippedRows: 0 }
+      surveySheet: { found: false, headers: [], rowCount: 0, skippedRows: 0, sheetName: null },
+      questionSheet: { found: false, headers: [], rowCount: 0, skippedRows: 0, sheetName: null }
     }
   };
 
@@ -91,9 +102,15 @@ async function parseXLSX(fileBuffer) {
   const surveySheet = findWorksheet(workbook, 'Survey Master');
   if (surveySheet) {
     result.diagnostics.surveySheet.found = true;
+    result.diagnostics.surveySheet.sheetName = surveySheet.name;
     const headers = [];
+    const fieldToColLetter = {};
     surveySheet.getRow(1).eachCell((cell, colNumber) => {
       headers[colNumber] = normalizeCellValue(cell.value);
+      const fieldName = mapSurveyColumnToField(headers[colNumber]);
+      if (fieldName && !fieldToColLetter[fieldName]) {
+        fieldToColLetter[fieldName] = colNumToLetter(colNumber);
+      }
     });
     result.diagnostics.surveySheet.headers = headers.filter(Boolean);
 
@@ -115,6 +132,8 @@ async function parseXLSX(fileBuffer) {
 
       if (hasData && survey.surveyId) {
         survey._sourceRow = rowNumber;
+        survey._sheet = surveySheet.name;
+        survey._fieldToCol = fieldToColLetter;
         result.surveys.push(survey);
       } else if (hasData) {
         result.diagnostics.surveySheet.skippedRows += 1;
@@ -127,9 +146,15 @@ async function parseXLSX(fileBuffer) {
   const questionSheet = findWorksheet(workbook, 'Question Master');
   if (questionSheet) {
     result.diagnostics.questionSheet.found = true;
+    result.diagnostics.questionSheet.sheetName = questionSheet.name;
     const headers = [];
+    const qFieldToColLetter = {};
     questionSheet.getRow(1).eachCell((cell, colNumber) => {
       headers[colNumber] = normalizeCellValue(cell.value);
+      const fieldName = mapQuestionColumnToField(headers[colNumber]);
+      if (fieldName && !qFieldToColLetter[fieldName]) {
+        qFieldToColLetter[fieldName] = colNumToLetter(colNumber);
+      }
     });
     result.diagnostics.questionSheet.headers = headers.filter(Boolean);
 
@@ -178,7 +203,9 @@ async function parseXLSX(fileBuffer) {
             questionMediaType: questionRow.questionMediaType || 'None',
             mode: questionRow.mode || 'None',
             translations: {},
-            _sourceRow: rowNumber
+            _sourceRow: rowNumber,
+            _sheet: questionSheet.name,
+            _fieldToCol: qFieldToColLetter
           };
         }
 
@@ -612,16 +639,38 @@ router.post('/', importUploadMiddleware, async (req, res) => {
       : existingSurveys;
     const surveysForValidation = [...otherSurveys, ...importData.surveys];
 
+    // Helper: enrich a validation error with cell address (e.g., "B5")
+    const enrichErrorsWithCells = (errors, row, fieldToCol, sheetName) => {
+      return (errors || []).map(err => {
+        const obj = typeof err === 'string' ? { message: err } : { ...err };
+        const col = obj.field && fieldToCol ? fieldToCol[obj.field] : null;
+        const cell = col ? `${col}${row}` : null;
+        return {
+          ...obj,
+          row,
+          column: col || null,
+          cell,
+          sheet: sheetName || null,
+          message: cell
+            ? `[${sheetName || 'sheet'} ${cell}] ${obj.message || ''}`
+            : `[Row ${row}${obj.field ? ` · ${obj.field}` : ''}] ${obj.message || ''}`
+        };
+      });
+    };
+
     // Validate surveys
     const errors = [];
     importData.surveys.forEach((survey, index) => {
       const validation = validator.validateSurvey(survey);
       if (!validation.isValid) {
+        const row = survey._sourceRow || (index + 2);
         errors.push({
           type: 'survey',
-          index: survey._sourceRow || (index + 2),
-          surveyId: survey.surveyId || `(Row ${index + 2})`,
-          errors: validation.errors
+          index: row,
+          row,
+          sheet: survey._sheet || 'Survey Master',
+          surveyId: survey.surveyId || `(Row ${row})`,
+          errors: enrichErrorsWithCells(validation.errors, row, survey._fieldToCol, survey._sheet)
         });
       }
     });
@@ -630,11 +679,14 @@ router.post('/', importUploadMiddleware, async (req, res) => {
     importData.questions.forEach((question, index) => {
       const validation = validator.validateQuestion(question, surveysForValidation, importData.questions);
       if (!validation.isValid) {
+        const row = question._sourceRow || (index + 2);
         errors.push({
           type: 'question',
-          index: question._sourceRow || (index + 2),
-          questionId: question.questionId || `(Row ${index + 2})`,
-          errors: validation.errors
+          index: row,
+          row,
+          sheet: question._sheet || 'Question Master',
+          questionId: question.questionId || `(Row ${row})`,
+          errors: enrichErrorsWithCells(validation.errors, row, question._fieldToCol, question._sheet)
         });
       }
     });
@@ -659,8 +711,16 @@ router.post('/', importUploadMiddleware, async (req, res) => {
     });
 
     // Clean internal fields before persisting
-    importData.surveys.forEach(s => { delete s._sourceRow; });
-    importData.questions.forEach(q => { delete q._sourceRow; });
+    importData.surveys.forEach(s => {
+      delete s._sourceRow;
+      delete s._sheet;
+      delete s._fieldToCol;
+    });
+    importData.questions.forEach(q => {
+      delete q._sourceRow;
+      delete q._sheet;
+      delete q._fieldToCol;
+    });
 
     // Import data using targeted upserts (non-destructive)
     if (overwrite) {
