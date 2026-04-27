@@ -290,6 +290,29 @@ class ValidationEngine {
       errors.push(...typeErrors);
     }
 
+    // Min/Max value sanity check — Max must be greater than Min when both are set
+    const minValRaw = questionData.minValue;
+    const maxValRaw = questionData.maxValue;
+    const hasMin = minValRaw !== null && minValRaw !== undefined && String(minValRaw).trim() !== '';
+    const hasMax = maxValRaw !== null && maxValRaw !== undefined && String(maxValRaw).trim() !== '';
+    if (hasMin && hasMax) {
+      const minNum = Number(minValRaw);
+      const maxNum = Number(maxValRaw);
+      if (!Number.isFinite(minNum)) {
+        errors.push({ field: 'minValue', message: 'Min Value must be a number', value: minValRaw });
+      }
+      if (!Number.isFinite(maxNum)) {
+        errors.push({ field: 'maxValue', message: 'Max Value must be a number', value: maxValRaw });
+      }
+      if (Number.isFinite(minNum) && Number.isFinite(maxNum) && maxNum <= minNum) {
+        errors.push({
+          field: 'maxValue',
+          message: `Max Value (${maxNum}) must be greater than Min Value (${minNum})`,
+          value: maxValRaw
+        });
+      }
+    }
+
     return {
       isValid: errors.length === 0,
       errors
