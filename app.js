@@ -4,7 +4,6 @@ const express = require('express');
 const cors = require('cors');
 const compression = require('compression');
 const bodyParser = require('body-parser');
-const path = require('path');
 
 const { initStore } = require('./data/store');
 const { requireAuth, requireAdmin } = require('./middleware/auth');
@@ -84,15 +83,6 @@ app.use('/api/translate', requireAuth, translateRouter);
 app.use('/api/admin', requireAuth, requireAdmin, adminRouter);
 app.use('/api/designations', requireAuth, designationsRouter);
 app.use('/api/access-sheet', requireAuth, accessSheetRouter);
-
-// Serve static files from React app in production (non-Vercel)
-if (process.env.NODE_ENV === 'production' && !process.env.VERCEL) {
-  app.use(express.static(path.join(__dirname, '../client/build')));
-
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../client/build', 'index.html'));
-  });
-}
 
 // Error handling middleware
 app.use((err, req, res, next) => {
