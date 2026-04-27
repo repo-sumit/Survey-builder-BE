@@ -633,11 +633,8 @@ router.post('/', importUploadMiddleware, async (req, res) => {
       });
     }
 
-    // Build validation context
-    const otherSurveys = overwrite
-      ? existingSurveys.filter(s => !incomingSurveyIds.has(s.surveyId))
-      : existingSurveys;
-    const surveysForValidation = [...otherSurveys, ...importData.surveys];
+    // Build validation context — questions reference surveys in this import
+    const surveysForValidation = importData.surveys;
 
     // Helper: enrich a validation error with cell address (e.g., "B5")
     const enrichErrorsWithCells = (errors, row, fieldToCol, sheetName) => {
