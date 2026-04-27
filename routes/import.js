@@ -77,15 +77,25 @@ async function parseXLSX(fileBuffer) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(fileBuffer);
 
-  const result = { surveys: [], questions: [], diagnostics: { sheetNames: workbook.worksheets.map(s => s.name) } };
+  const result = {
+    surveys: [],
+    questions: [],
+    diagnostics: {
+      sheetNames: workbook.worksheets.map(s => s.name),
+      surveySheet: { found: false, headers: [], rowCount: 0, skippedRows: 0 },
+      questionSheet: { found: false, headers: [], rowCount: 0, skippedRows: 0 }
+    }
+  };
 
   // Parse Survey Master sheet (case-insensitive, trim-aware)
   const surveySheet = findWorksheet(workbook, 'Survey Master');
   if (surveySheet) {
+    result.diagnostics.surveySheet.found = true;
     const headers = [];
     surveySheet.getRow(1).eachCell((cell, colNumber) => {
       headers[colNumber] = normalizeCellValue(cell.value);
     });
+    result.diagnostics.surveySheet.headers = headers.filter(Boolean);
 
     surveySheet.eachRow((row, rowNumber) => {
       if (rowNumber === 1) return; // Skip header
@@ -106,17 +116,22 @@ async function parseXLSX(fileBuffer) {
       if (hasData && survey.surveyId) {
         survey._sourceRow = rowNumber;
         result.surveys.push(survey);
+      } else if (hasData) {
+        result.diagnostics.surveySheet.skippedRows += 1;
       }
     });
+    result.diagnostics.surveySheet.rowCount = result.surveys.length;
   }
 
   // Parse Question Master sheet (case-insensitive, trim-aware)
   const questionSheet = findWorksheet(workbook, 'Question Master');
   if (questionSheet) {
+    result.diagnostics.questionSheet.found = true;
     const headers = [];
     questionSheet.getRow(1).eachCell((cell, colNumber) => {
       headers[colNumber] = normalizeCellValue(cell.value);
     });
+    result.diagnostics.questionSheet.headers = headers.filter(Boolean);
 
     const questionsByKey = {};
 
@@ -137,7 +152,12 @@ async function parseXLSX(fileBuffer) {
 
       if (!hasData) return; // Skip empty rows
 
-      if (questionRow.surveyId && questionRow.questionId) {
+      if (!questionRow.surveyId || !questionRow.questionId) {
+        result.diagnostics.questionSheet.skippedRows += 1;
+        return;
+      }
+
+      {
         const key = `${questionRow.surveyId}_${questionRow.questionId}_${questionRow.questionType}`;
 
         if (!questionsByKey[key]) {
@@ -175,6 +195,7 @@ async function parseXLSX(fileBuffer) {
     });
 
     result.questions = Object.values(questionsByKey).map(applyPrimaryTranslation);
+    result.diagnostics.questionSheet.rowCount = result.questions.length;
   }
 
   return result;
@@ -500,35 +521,41 @@ router.post('/', importUploadMiddleware, async (req, res) => {
         });
       }
 
-      if (importData.surveys.length === 0 && importData.questions.length === 0) {
-        return res.status(400).json({
-          error: 'No data found. Ensure the file has "Survey Master" and "Question Master" sheets.',
-          details: {
-            sheetsFound: importData.diagnostics?.sheetNames || [],
-            hasSurveyMaster: false,
-            hasQuestionMaster: false
-          }
-        });
-      }
+      const diag = importData.diagnostics || {};
+      const sheetNames = diag.sheetNames || [];
+      const surveyDiag = diag.surveySheet || { found: false };
+      const questionDiag = diag.questionSheet || { found: false };
 
-      // Allow import with only surveys or only questions (e.g., adding questions to existing surveys)
-      if (importData.surveys.length === 0) {
+      // Build a precise error message based on what we actually found
+      const buildSheetError = (sheetName, sheetDiag, requiredColumns) => {
+        if (!sheetDiag.found) {
+          return `"${sheetName}" sheet not found. Sheets in your file: ${sheetNames.length ? sheetNames.join(', ') : '(none)'}.`;
+        }
+        if (sheetDiag.headers.length === 0) {
+          return `"${sheetName}" sheet is empty (no header row in row 1).`;
+        }
+        if (sheetDiag.rowCount === 0 && sheetDiag.skippedRows > 0) {
+          return `"${sheetName}" sheet has ${sheetDiag.skippedRows} data row(s), but none has a valid ${requiredColumns}. Headers found: ${sheetDiag.headers.join(', ')}.`;
+        }
+        if (sheetDiag.rowCount === 0) {
+          return `"${sheetName}" sheet has no data rows. Headers found: ${sheetDiag.headers.join(', ')}.`;
+        }
+        return null;
+      };
+
+      const surveyError = buildSheetError('Survey Master', surveyDiag, 'Survey ID');
+      const questionError = buildSheetError('Question Master', questionDiag, 'Survey ID and Question ID');
+
+      if (surveyError || questionError) {
+        const messages = [surveyError, questionError].filter(Boolean);
         return res.status(400).json({
-          error: 'No "Survey Master" sheet found. Excel imports require both Survey Master and Question Master sheets.',
+          error: messages[0],
+          message: messages.join(' '),
+          errors: messages,
           details: {
-            sheetsFound: importData.diagnostics?.sheetNames || [],
-            hasSurveyMaster: false,
-            hasQuestionMaster: importData.questions.length > 0
-          }
-        });
-      }
-      if (importData.questions.length === 0) {
-        return res.status(400).json({
-          error: 'No "Question Master" sheet found. Excel imports require both Survey Master and Question Master sheets.',
-          details: {
-            sheetsFound: importData.diagnostics?.sheetNames || [],
-            hasSurveyMaster: importData.surveys.length > 0,
-            hasQuestionMaster: false
+            sheetsFound: sheetNames,
+            surveySheet: surveyDiag,
+            questionSheet: questionDiag
           }
         });
       }
