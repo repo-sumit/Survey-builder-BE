@@ -283,6 +283,9 @@ class ValidationEngine {
     const childMappingErrors = this._validateChildMappings(questionData, allQuestions);
     errors.push(...childMappingErrors);
 
+    const childMandatoryErrors = this._validateChildMandatory(questionData, allQuestions);
+    errors.push(...childMandatoryErrors);
+
     // Question type specific validations
     const questionType = questionData.questionType;
     if (questionType) {
@@ -732,6 +735,51 @@ class ValidationEngine {
         field: 'options',
         message: `Child question IDs cannot be mapped to multiple options/questions: ${Array.from(conflicts).join(', ')}`,
         value: ''
+      });
+    }
+
+    return errors;
+  }
+
+  _validateChildMandatory(questionData, allQuestions) {
+    const errors = [];
+    const childId = String(questionData.questionId || '');
+    if (!childId.includes('.')) return errors;
+    if (questionData.isMandatory !== 'Yes') return errors;
+
+    const parentId = this._normalizeQuestionId(questionData.sourceQuestion)
+      || (() => {
+        const norm = this._normalizeQuestionId(childId);
+        return norm.includes('.') ? norm.split('.').slice(0, -1).join('.') : '';
+      })();
+    if (!parentId) return errors;
+
+    const parent = allQuestions.find(q =>
+      this._normalizeQuestionId(q.questionId) === parentId &&
+      q.surveyId === questionData.surveyId
+    );
+    if (!parent) return errors;
+
+    const parentOptions = this._getOptionsForQuestion(parent);
+    const optionsWithChildren = parentOptions.reduce((acc, opt) => {
+      const list = this._parseChildList(opt?.children || '');
+      return acc + (list.length > 0 ? 1 : 0);
+    }, 0);
+
+    if (optionsWithChildren >= 2) {
+      errors.push({
+        field: 'isMandatory',
+        message: `Child question cannot be mandatory: parent ${parent.questionId} has child questions mapped to ${optionsWithChildren} different options, so none of its children can be mandatory.`,
+        value: questionData.isMandatory
+      });
+      return errors;
+    }
+
+    if (parent.isMandatory !== 'Yes') {
+      errors.push({
+        field: 'isMandatory',
+        message: `Child question cannot be mandatory because parent ${parent.questionId} is not mandatory. Set the parent to mandatory first, or set this child to "No".`,
+        value: questionData.isMandatory
       });
     }
 
