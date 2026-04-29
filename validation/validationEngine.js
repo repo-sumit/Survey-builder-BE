@@ -277,9 +277,6 @@ class ValidationEngine {
       }
     }
 
-    const parentTypeErrors = this._validateChildParentType(questionData, allQuestions);
-    errors.push(...parentTypeErrors);
-
     const childMappingErrors = this._validateChildMappings(questionData, allQuestions);
     errors.push(...childMappingErrors);
 
@@ -674,41 +671,6 @@ class ValidationEngine {
       }
     }
     return [];
-  }
-
-  _validateChildParentType(questionData, allQuestions) {
-    const errors = [];
-    const parentId = this._normalizeQuestionId(questionData.sourceQuestion);
-    if (!parentId) {
-      return errors;
-    }
-    const parent = allQuestions.find(q =>
-      this._normalizeQuestionId(q.questionId) === parentId &&
-      q.surveyId === questionData.surveyId
-    );
-    if (!parent) {
-      return errors;
-    }
-
-    // Only enforce the MCSS-parent rule if the parent actually claims this
-    // child in one of its OptionXChildren entries. Sharing an ID prefix alone
-    // (e.g. Q2.1.3 under a non-MCSS Q2.1 that has no child mappings) is fine.
-    const childId = this._normalizeQuestionId(questionData.questionId);
-    const parentClaimsChild = this._getOptionsForQuestion(parent).some(opt =>
-      this._parseChildList(opt?.children || '').includes(childId)
-    );
-    if (!parentClaimsChild) {
-      return errors;
-    }
-
-    if (parent.questionType !== 'Multiple Choice Single Select') {
-      errors.push({
-        field: 'sourceQuestion',
-        message: 'Only Multiple Choice Single Select questions can have child questions. Change the Question ID or parent.',
-        value: questionData.sourceQuestion
-      });
-    }
-    return errors;
   }
 
   _validateChildMappings(questionData, allQuestions) {
