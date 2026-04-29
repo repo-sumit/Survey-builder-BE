@@ -689,6 +689,56 @@ function parseSurveyIdsParam(value) {
   return String(value).split(',').map(s => s.trim()).filter(Boolean);
 }
 
+// POST /api/import/validate-dump - Parse + validate without persisting. Only
+// returns errors for rows whose `mode` is "Correction" or "New Data" (rows
+// flagged "None" or with no mode are ignored). Used by the dump-sheet
+// validator UI to surface issues without writing anything to the database.
+router.post('/validate-dump', importUploadMiddleware, async (req, res) => {
+  try {
+    const result = await parseAndValidate(req);
+    if (result.error) {
+      return res.status(result.error.status).json(result.error.body);
+    }
+
+    const { importData, validationErrors } = result;
+    const allowedModes = new Set(['Correction', 'New Data']);
+
+    const surveyModeById = new Map(
+      importData.surveys.map(s => [s.surveyId, String(s.mode || '').trim()])
+    );
+    const questionModeByKey = new Map(
+      importData.questions.map(q => [`${q.surveyId}::${q.questionId}`, String(q.mode || '').trim()])
+    );
+
+    const filteredErrors = validationErrors.filter(e => {
+      if (e.type === 'survey') {
+        return allowedModes.has(surveyModeById.get(e.surveyId));
+      }
+      if (e.type === 'question') {
+        return allowedModes.has(questionModeByKey.get(`${e.surveyId}::${e.questionId}`));
+      }
+      return false;
+    });
+
+    const consideredQuestions = importData.questions.filter(q => allowedModes.has(String(q.mode || '').trim())).length;
+    const consideredSurveys = importData.surveys.filter(s => allowedModes.has(String(s.mode || '').trim())).length;
+
+    return res.json({
+      validationErrors: filteredErrors,
+      surveysCount: consideredSurveys,
+      questionsCount: consideredQuestions,
+      totalSurveys: importData.surveys.length,
+      totalQuestions: importData.questions.length
+    });
+  } catch (error) {
+    console.error('Validate-dump error:', error);
+    res.status(500).json({
+      error: 'Failed to validate file',
+      message: error.message
+    });
+  }
+});
+
 // POST /api/import/preview - Parse + validate without persisting. Returns the
 // list of surveys/questions found in the file and any validation errors so the
 // client can let the user pick which surveys to actually import.
