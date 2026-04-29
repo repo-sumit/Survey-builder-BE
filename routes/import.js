@@ -517,96 +517,220 @@ async function runInBatches(items, batchSize, worker) {
   }
 }
 
+// Parse + validate the uploaded file. Returns either an `error` describing why
+// parsing/validation could not run, or { importData, validationErrors }.
+async function parseAndValidate(req) {
+  if (!req.file) {
+    return { error: { status: 400, body: { error: 'No file uploaded' } } };
+  }
+
+  const fileExt = path.extname(req.file.originalname || '').toLowerCase();
+  const fileBuffer = req.file.buffer;
+
+  if (!ALLOWED_UPLOAD_EXTENSIONS.has(fileExt)) {
+    return { error: { status: 400, body: { error: 'Unsupported file format. Please upload XLSX or CSV file.' } } };
+  }
+
+  if (!fileBuffer || fileBuffer.length === 0) {
+    return { error: { status: 400, body: { error: 'Uploaded file is empty.' } } };
+  }
+
+  let importData;
+
+  if (fileExt === '.xlsx' || fileExt === '.xls') {
+    try {
+      importData = await parseXLSX(fileBuffer);
+    } catch (parseErr) {
+      return { error: { status: 400, body: {
+        error: 'Failed to parse Excel file. The file may be corrupted or in an unsupported format.',
+        message: parseErr.message
+      } } };
+    }
+
+    const diag = importData.diagnostics || {};
+    const sheetNames = diag.sheetNames || [];
+    const surveyDiag = diag.surveySheet || { found: false };
+    const questionDiag = diag.questionSheet || { found: false };
+
+    const buildSheetError = (sheetName, sheetDiag, requiredColumns) => {
+      if (!sheetDiag.found) {
+        return `"${sheetName}" sheet not found. Sheets in your file: ${sheetNames.length ? sheetNames.join(', ') : '(none)'}.`;
+      }
+      if (sheetDiag.headers.length === 0) {
+        return `"${sheetName}" sheet is empty (no header row in row 1).`;
+      }
+      if (sheetDiag.rowCount === 0 && sheetDiag.skippedRows > 0) {
+        return `"${sheetName}" sheet has ${sheetDiag.skippedRows} data row(s), but none has a valid ${requiredColumns}. Headers found: ${sheetDiag.headers.join(', ')}.`;
+      }
+      if (sheetDiag.rowCount === 0) {
+        return `"${sheetName}" sheet has no data rows. Headers found: ${sheetDiag.headers.join(', ')}.`;
+      }
+      return null;
+    };
+
+    const surveyError = buildSheetError('Survey Master', surveyDiag, 'Survey ID');
+    const questionError = buildSheetError('Question Master', questionDiag, 'Survey ID and Question ID');
+
+    if (surveyError || questionError) {
+      const messages = [surveyError, questionError].filter(Boolean);
+      return { error: { status: 400, body: {
+        error: messages[0],
+        message: messages.join(' '),
+        errors: messages,
+        details: {
+          sheetsFound: sheetNames,
+          surveySheet: surveyDiag,
+          questionSheet: questionDiag
+        }
+      } } };
+    }
+  } else if (fileExt === '.csv') {
+    const sheetType = req.query.sheetType || 'both';
+    importData = await parseCSV(fileBuffer, sheetType);
+
+    if (importData.surveys.length === 0 && importData.questions.length === 0) {
+      return { error: { status: 400, body: {
+        error: 'Could not detect CSV type. Please upload a Survey Master or Question Master CSV.'
+      } } };
+    }
+  }
+
+  const totalImportRows = importData.surveys.length + importData.questions.length;
+  if (totalImportRows > MAX_IMPORT_ROWS) {
+    return { error: { status: 413, body: {
+      error: 'Import payload too large',
+      message: `The uploaded file contains ${totalImportRows} rows, which exceeds the ${MAX_IMPORT_ROWS}-row import limit.`,
+      details: { maxRows: MAX_IMPORT_ROWS, totalRows: totalImportRows }
+    } } };
+  }
+
+  const enrichErrorsWithCells = (errors, row, fieldToCol, sheetName) => {
+    return (errors || []).map(err => {
+      const obj = typeof err === 'string' ? { message: err } : { ...err };
+      const col = obj.field && fieldToCol ? fieldToCol[obj.field] : null;
+      const cell = col ? `${col}${row}` : null;
+      return {
+        ...obj,
+        row,
+        column: col || null,
+        cell,
+        sheet: sheetName || null,
+        message: cell
+          ? `[${sheetName || 'sheet'} ${cell}] ${obj.message || ''}`
+          : `[Row ${row}${obj.field ? ` · ${obj.field}` : ''}] ${obj.message || ''}`
+      };
+    });
+  };
+
+  const surveysForValidation = importData.surveys;
+  const validationErrors = [];
+
+  importData.surveys.forEach((survey, index) => {
+    const validation = validator.validateSurvey(survey);
+    if (!validation.isValid) {
+      const row = survey._sourceRow || (index + 2);
+      validationErrors.push({
+        type: 'survey',
+        index: row,
+        row,
+        sheet: survey._sheet || 'Survey Master',
+        surveyId: survey.surveyId || `(Row ${row})`,
+        errors: enrichErrorsWithCells(validation.errors, row, survey._fieldToCol, survey._sheet)
+      });
+    }
+  });
+
+  importData.questions.forEach((question, index) => {
+    const validation = validator.validateQuestion(question, surveysForValidation, importData.questions);
+    if (!validation.isValid) {
+      const row = question._sourceRow || (index + 2);
+      validationErrors.push({
+        type: 'question',
+        index: row,
+        row,
+        sheet: question._sheet || 'Question Master',
+        surveyId: question.surveyId || '',
+        questionId: question.questionId || `(Row ${row})`,
+        errors: enrichErrorsWithCells(validation.errors, row, question._fieldToCol, question._sheet)
+      });
+    }
+  });
+
+  return { importData, validationErrors };
+}
+
+function stripInternalFields(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const { _sourceRow, _sheet, _fieldToCol, ...rest } = obj;
+  return rest;
+}
+
+function parseSurveyIdsParam(value) {
+  if (!value) return null;
+  if (Array.isArray(value)) {
+    return value.map(v => String(v).trim()).filter(Boolean);
+  }
+  return String(value).split(',').map(s => s.trim()).filter(Boolean);
+}
+
+// POST /api/import/preview - Parse + validate without persisting. Returns the
+// list of surveys/questions found in the file and any validation errors so the
+// client can let the user pick which surveys to actually import.
+router.post('/preview', importUploadMiddleware, async (req, res) => {
+  try {
+    const result = await parseAndValidate(req);
+    if (result.error) {
+      return res.status(result.error.status).json(result.error.body);
+    }
+
+    const { importData, validationErrors } = result;
+    const surveys = importData.surveys.map(stripInternalFields);
+    const questions = importData.questions.map(stripInternalFields);
+
+    return res.json({
+      surveys,
+      questions,
+      validationErrors,
+      surveysCount: surveys.length,
+      questionsCount: questions.length
+    });
+  } catch (error) {
+    console.error('Import preview error:', error);
+    res.status(500).json({
+      error: 'Failed to preview file',
+      message: error.message
+    });
+  }
+});
+
 // POST /api/import - Import survey from XLSX/CSV
 router.post('/', importUploadMiddleware, async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
     const overwrite = String(req.query.overwrite || '').toLowerCase() === 'true';
-    const fileExt = path.extname(req.file.originalname || '').toLowerCase();
-    const fileBuffer = req.file.buffer;
 
-    if (!ALLOWED_UPLOAD_EXTENSIONS.has(fileExt)) {
-      return res.status(400).json({ error: 'Unsupported file format. Please upload XLSX or CSV file.' });
+    const result = await parseAndValidate(req);
+    if (result.error) {
+      return res.status(result.error.status).json(result.error.body);
     }
 
-    if (!fileBuffer || fileBuffer.length === 0) {
-      return res.status(400).json({ error: 'Uploaded file is empty.' });
-    }
+    let { importData, validationErrors } = result;
 
-    let importData;
+    // Apply optional surveyIds filter — when present, only import the listed
+    // surveys (and questions belonging to them); errors are filtered too.
+    const selectedSurveyIds = parseSurveyIdsParam(req.query.surveyIds || (req.body && req.body.surveyIds));
+    if (selectedSurveyIds && selectedSurveyIds.length > 0) {
+      const idSet = new Set(selectedSurveyIds);
+      importData.surveys = importData.surveys.filter(s => idSet.has(s.surveyId));
+      importData.questions = importData.questions.filter(q => idSet.has(q.surveyId));
+      validationErrors = validationErrors.filter(e => idSet.has(e.surveyId));
 
-    if (fileExt === '.xlsx' || fileExt === '.xls') {
-      try {
-        importData = await parseXLSX(fileBuffer);
-      } catch (parseErr) {
+      if (importData.surveys.length === 0) {
         return res.status(400).json({
-          error: 'Failed to parse Excel file. The file may be corrupted or in an unsupported format.',
-          message: parseErr.message
+          error: 'No surveys to import',
+          message: 'None of the selected Survey IDs were found in the uploaded file.',
+          details: { selectedSurveyIds }
         });
       }
-
-      const diag = importData.diagnostics || {};
-      const sheetNames = diag.sheetNames || [];
-      const surveyDiag = diag.surveySheet || { found: false };
-      const questionDiag = diag.questionSheet || { found: false };
-
-      // Build a precise error message based on what we actually found
-      const buildSheetError = (sheetName, sheetDiag, requiredColumns) => {
-        if (!sheetDiag.found) {
-          return `"${sheetName}" sheet not found. Sheets in your file: ${sheetNames.length ? sheetNames.join(', ') : '(none)'}.`;
-        }
-        if (sheetDiag.headers.length === 0) {
-          return `"${sheetName}" sheet is empty (no header row in row 1).`;
-        }
-        if (sheetDiag.rowCount === 0 && sheetDiag.skippedRows > 0) {
-          return `"${sheetName}" sheet has ${sheetDiag.skippedRows} data row(s), but none has a valid ${requiredColumns}. Headers found: ${sheetDiag.headers.join(', ')}.`;
-        }
-        if (sheetDiag.rowCount === 0) {
-          return `"${sheetName}" sheet has no data rows. Headers found: ${sheetDiag.headers.join(', ')}.`;
-        }
-        return null;
-      };
-
-      const surveyError = buildSheetError('Survey Master', surveyDiag, 'Survey ID');
-      const questionError = buildSheetError('Question Master', questionDiag, 'Survey ID and Question ID');
-
-      if (surveyError || questionError) {
-        const messages = [surveyError, questionError].filter(Boolean);
-        return res.status(400).json({
-          error: messages[0],
-          message: messages.join(' '),
-          errors: messages,
-          details: {
-            sheetsFound: sheetNames,
-            surveySheet: surveyDiag,
-            questionSheet: questionDiag
-          }
-        });
-      }
-    } else if (fileExt === '.csv') {
-      const sheetType = req.query.sheetType || 'both';
-      importData = await parseCSV(fileBuffer, sheetType);
-    }
-
-    if (fileExt === '.csv' && importData.surveys.length === 0 && importData.questions.length === 0) {
-      return res.status(400).json({
-        error: 'Could not detect CSV type. Please upload a Survey Master or Question Master CSV.'
-      });
-    }
-
-    const totalImportRows = importData.surveys.length + importData.questions.length;
-    if (totalImportRows > MAX_IMPORT_ROWS) {
-      return res.status(413).json({
-        error: 'Import payload too large',
-        message: `The uploaded file contains ${totalImportRows} rows, which exceeds the ${MAX_IMPORT_ROWS}-row import limit.`,
-        details: {
-          maxRows: MAX_IMPORT_ROWS,
-          totalRows: totalImportRows
-        }
-      });
     }
 
     // Check for duplicate survey IDs (targeted query instead of loading all surveys)
@@ -633,65 +757,10 @@ router.post('/', importUploadMiddleware, async (req, res) => {
       });
     }
 
-    // Build validation context — questions reference surveys in this import
-    const surveysForValidation = importData.surveys;
-
-    // Helper: enrich a validation error with cell address (e.g., "B5")
-    const enrichErrorsWithCells = (errors, row, fieldToCol, sheetName) => {
-      return (errors || []).map(err => {
-        const obj = typeof err === 'string' ? { message: err } : { ...err };
-        const col = obj.field && fieldToCol ? fieldToCol[obj.field] : null;
-        const cell = col ? `${col}${row}` : null;
-        return {
-          ...obj,
-          row,
-          column: col || null,
-          cell,
-          sheet: sheetName || null,
-          message: cell
-            ? `[${sheetName || 'sheet'} ${cell}] ${obj.message || ''}`
-            : `[Row ${row}${obj.field ? ` · ${obj.field}` : ''}] ${obj.message || ''}`
-        };
-      });
-    };
-
-    // Validate surveys
-    const errors = [];
-    importData.surveys.forEach((survey, index) => {
-      const validation = validator.validateSurvey(survey);
-      if (!validation.isValid) {
-        const row = survey._sourceRow || (index + 2);
-        errors.push({
-          type: 'survey',
-          index: row,
-          row,
-          sheet: survey._sheet || 'Survey Master',
-          surveyId: survey.surveyId || `(Row ${row})`,
-          errors: enrichErrorsWithCells(validation.errors, row, survey._fieldToCol, survey._sheet)
-        });
-      }
-    });
-
-    // Validate questions
-    importData.questions.forEach((question, index) => {
-      const validation = validator.validateQuestion(question, surveysForValidation, importData.questions);
-      if (!validation.isValid) {
-        const row = question._sourceRow || (index + 2);
-        errors.push({
-          type: 'question',
-          index: row,
-          row,
-          sheet: question._sheet || 'Question Master',
-          questionId: question.questionId || `(Row ${row})`,
-          errors: enrichErrorsWithCells(validation.errors, row, question._fieldToCol, question._sheet)
-        });
-      }
-    });
-
-    if (errors.length > 0) {
+    if (validationErrors.length > 0) {
       return res.status(400).json({
         error: 'Validation failed',
-        validationErrors: errors,
+        validationErrors,
         surveysCount: importData.surveys.length,
         questionsCount: importData.questions.length
       });
@@ -722,7 +791,8 @@ router.post('/', importUploadMiddleware, async (req, res) => {
     // Import data using targeted upserts (non-destructive)
     if (overwrite) {
       // Delete existing surveys that will be replaced (cascade deletes their questions)
-      await runInBatches(duplicateSurveyIds, UPSERT_BATCH_SIZE, (surveyId) => deleteSurvey(surveyId));
+      const toDelete = duplicateSurveyIds.filter(id => incomingSurveyIds.includes(id));
+      await runInBatches(toDelete, UPSERT_BATCH_SIZE, (surveyId) => deleteSurvey(surveyId));
     }
 
     await runInBatches(importData.surveys, UPSERT_BATCH_SIZE, (survey) => upsertSurvey(survey));
