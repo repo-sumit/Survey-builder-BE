@@ -131,6 +131,7 @@ async function parseXLSX(fileBuffer) {
       });
 
       if (hasData && survey.surveyId) {
+        survey.mode = normalizeMode(survey.mode);
         survey._sourceRow = rowNumber;
         survey._sheet = surveySheet.name;
         survey._fieldToCol = fieldToColLetter;
@@ -201,7 +202,7 @@ async function parseXLSX(fileBuffer) {
             tableQuestionValue: normalizeTableQuestionValue(questionRow.tableQuestionValue),
             questionMediaLink: questionRow.questionMediaLink || '',
             questionMediaType: questionRow.questionMediaType || 'None',
-            mode: questionRow.mode || 'None',
+            mode: normalizeMode(questionRow.mode),
             translations: {},
             _sourceRow: rowNumber,
             _sheet: questionSheet.name,
@@ -259,6 +260,18 @@ function normalizeTableQuestionValue(value) {
   return String(value).replace(/\\n/g, '\n');
 }
 
+// Mode column comes in many casings ("new data", "New data", "NEW DATA", etc.)
+// — collapse to the canonical form so downstream filters/enums work.
+function normalizeMode(value) {
+  if (value === null || value === undefined) return 'None';
+  const str = String(value).trim().toLowerCase();
+  if (str === '' || str === 'none') return 'None';
+  if (str === 'new data' || str === 'newdata') return 'New Data';
+  if (str === 'correction') return 'Correction';
+  if (str === 'delete data' || str === 'deletedata') return 'Delete Data';
+  return String(value).trim();
+}
+
 // Helper function to parse CSV file
 async function parseCSV(fileBuffer, sheetType) {
   const fileContent = fileBuffer.toString('utf8');
@@ -297,7 +310,7 @@ async function parseCSV(fileBuffer, sheetType) {
             tableQuestionValue: normalizeTableQuestionValue(questionRow.tableQuestionValue),
             questionMediaLink: questionRow.questionMediaLink || '',
             questionMediaType: questionRow.questionMediaType || 'None',
-            mode: questionRow.mode || 'None',
+            mode: normalizeMode(questionRow.mode),
             translations: {}
           };
         }
@@ -398,6 +411,7 @@ function mapSurveyRecord(record) {
     const fieldName = mapSurveyColumnToField(key);
     survey[fieldName] = record[key];
   });
+  survey.mode = normalizeMode(survey.mode);
   return survey;
 }
 
