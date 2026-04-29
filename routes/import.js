@@ -191,14 +191,14 @@ async function parseXLSX(fileBuffer) {
             questionId: questionRow.questionId,
             questionType: questionRow.questionType,
             isDynamic: questionRow.isDynamic,
-            isMandatory: questionRow.isMandatory,
+            isMandatory: normalizeIsMandatory(questionRow.isMandatory),
             sourceQuestion: questionRow.sourceQuestion || '',
             textInputType: normalizeTextInputType(questionRow.textInputType) || 'None',
             textLimitCharacters: String(questionRow.textLimitCharacters || ''),
             maxValue: String(questionRow.maxValue || ''),
             minValue: String(questionRow.minValue || ''),
             tableHeaderValue: questionRow.tableHeaderValue || '',
-            tableQuestionValue: questionRow.tableQuestionValue || '',
+            tableQuestionValue: normalizeTableQuestionValue(questionRow.tableQuestionValue),
             questionMediaLink: questionRow.questionMediaLink || '',
             questionMediaType: questionRow.questionMediaType || 'None',
             mode: questionRow.mode || 'None',
@@ -215,7 +215,7 @@ async function parseXLSX(fileBuffer) {
           questionDescription: questionRow.questionDescription || '',
           questionDescriptionOptional: questionRow.questionDescriptionOptional || '',
           tableHeaderValue: questionRow.tableHeaderValue || '',
-          tableQuestionValue: questionRow.tableQuestionValue || '',
+          tableQuestionValue: normalizeTableQuestionValue(questionRow.tableQuestionValue),
           options: parseOptions(questionRow)
         };
       }
@@ -241,6 +241,22 @@ function normalizeTextInputType(value) {
     'none': 'None'
   };
   return map[normalized.toLowerCase()] || normalized;
+}
+
+// Empty cells in the "Is Mandatory" column are treated as "No" so the column
+// can be left blank in the import sheet.
+function normalizeIsMandatory(value) {
+  if (value === null || value === undefined) return 'No';
+  const str = String(value).trim();
+  return str === '' ? 'No' : str;
+}
+
+// Cells that come from sources where newlines were escaped (e.g. CSV exports)
+// may contain the literal two-char sequence "\n" instead of a real line break.
+// Treat that literal as a row separator so the format check passes.
+function normalizeTableQuestionValue(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/\\n/g, '\n');
 }
 
 // Helper function to parse CSV file
@@ -271,27 +287,27 @@ async function parseCSV(fileBuffer, sheetType) {
             questionId: questionRow.questionId,
             questionType: questionRow.questionType,
             isDynamic: questionRow.isDynamic,
-            isMandatory: questionRow.isMandatory,
+            isMandatory: normalizeIsMandatory(questionRow.isMandatory),
             sourceQuestion: questionRow.sourceQuestion || '',
             textInputType: questionRow.textInputType || 'None',
             textLimitCharacters: questionRow.textLimitCharacters || '',
             maxValue: questionRow.maxValue || '',
             minValue: questionRow.minValue || '',
             tableHeaderValue: questionRow.tableHeaderValue || '',
-            tableQuestionValue: questionRow.tableQuestionValue || '',
+            tableQuestionValue: normalizeTableQuestionValue(questionRow.tableQuestionValue),
             questionMediaLink: questionRow.questionMediaLink || '',
             questionMediaType: questionRow.questionMediaType || 'None',
             mode: questionRow.mode || 'None',
             translations: {}
           };
         }
-        
+
         const language = questionRow.mediumInEnglish || questionRow.medium || 'English';
         questionsByKey[key].translations[language] = {
           questionDescription: questionRow.questionDescription || '',
           questionDescriptionOptional: questionRow.questionDescriptionOptional || '',
           tableHeaderValue: questionRow.tableHeaderValue || '',
-          tableQuestionValue: questionRow.tableQuestionValue || '',
+          tableQuestionValue: normalizeTableQuestionValue(questionRow.tableQuestionValue),
           options: parseOptions(questionRow)
         };
       }

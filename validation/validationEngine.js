@@ -561,16 +561,13 @@ class ValidationEngine {
         }
       }
 
-      if (!questionData.tableQuestionValue) {
-        errors.push({
-          field: 'tableQuestionValue',
-          message: 'Table Question Value is required for tabular questions',
-          value: ''
-        });
-      } else {
-        // Validate format: a:Question1\nb:Question2
-        const formatRegex = /^[a-z]:.+(\n[a-z]:.+)*$/;
-        if (!formatRegex.test(questionData.tableQuestionValue)) {
+      if (questionData.tableQuestionValue) {
+        // Treat literal "\n" (backslash-n) as a real line break so values that
+        // come from sources where newlines were escaped still validate.
+        const normalized = String(questionData.tableQuestionValue).replace(/\\n/g, '\n');
+        // Allow upper- or lower-case letter prefixes (a:, B:, etc.).
+        const formatRegex = /^[A-Za-z]:.*(\n[A-Za-z]:.*)*$/;
+        if (!formatRegex.test(normalized)) {
           errors.push({
             field: 'tableQuestionValue',
             message: 'Table Question Value must be in format: a:Question 1\\nb:Question 2',
@@ -759,21 +756,6 @@ class ValidationEngine {
       q.surveyId === questionData.surveyId
     );
     if (!parent) return errors;
-
-    const parentOptions = this._getOptionsForQuestion(parent);
-    const optionsWithChildren = parentOptions.reduce((acc, opt) => {
-      const list = this._parseChildList(opt?.children || '');
-      return acc + (list.length > 0 ? 1 : 0);
-    }, 0);
-
-    if (optionsWithChildren >= 2) {
-      errors.push({
-        field: 'isMandatory',
-        message: `Child question cannot be mandatory: parent ${parent.questionId} has child questions mapped to ${optionsWithChildren} different options, so none of its children can be mandatory.`,
-        value: questionData.isMandatory
-      });
-      return errors;
-    }
 
     if (parent.isMandatory !== 'Yes') {
       errors.push({
