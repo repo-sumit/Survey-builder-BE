@@ -518,48 +518,97 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
       newQuestionId = `Q${maxQuestionNum + 1}`;
     }
 
-    // Deep-clone the original and strip ALL child-question references so the
-    // duplicate is completely independent of any parent-child mapping.
-    const safeOriginal = JSON.parse(JSON.stringify(originalQuestion));
+    // Find all descendants of the original (questions whose ID starts with
+    // `${originalQuestionId}.`) so we can clone the whole subtree with remapped
+    // IDs. E.g. duplicating Q2.1 as Q3 also clones Q2.1.1 → Q3.1, Q2.1.2 → Q3.2,
+    // and any deeper levels (Q2.1.1.1 → Q3.1.1, etc.).
+    const allQuestionsBefore = await getQuestions(surveyId);
+    const originalId = originalQuestion.questionId;
+    const descendants = allQuestionsBefore.filter(q =>
+      q.questionId !== originalId && q.questionId.startsWith(`${originalId}.`)
+    );
 
-    const stripChildrenFromOptions = (opts) => {
-      if (!Array.isArray(opts)) return opts;
-      return opts.map(opt => (opt && typeof opt === 'object') ? { ...opt, children: '' } : opt);
-    };
+    // ID remap: old → new. The original's tail is replaced with the new prefix.
+    const idMap = new Map();
+    idMap.set(originalId, newQuestionId);
+    descendants.forEach(d => {
+      const tail = d.questionId.slice(originalId.length); // includes leading dot
+      idMap.set(d.questionId, `${newQuestionId}${tail}`);
+    });
 
-    if (safeOriginal.translations && typeof safeOriginal.translations === 'object') {
-      for (const lang of Object.keys(safeOriginal.translations)) {
-        const t = safeOriginal.translations[lang];
-        if (t && typeof t === 'object') {
-          t.options = stripChildrenFromOptions(t.options);
-        }
-      }
-    }
-
-    const duplicatedQuestion = {
-      ...safeOriginal,
-      questionId: newQuestionId,
-      sourceQuestion: '',
-      options: stripChildrenFromOptions(safeOriginal.options)
-    };
-
-    const existingQ = await getQuestion(surveyId, newQuestionId);
-    if (existingQ) {
+    // Collision check against existing IDs in the survey
+    const existingIds = new Set(allQuestionsBefore.map(q => q.questionId));
+    const collisions = [...idMap.values()].filter(id => existingIds.has(id));
+    if (collisions.length > 0) {
       return res.status(400).json({
         error: 'Question ID already exists',
-        message: `Question ID "${newQuestionId}" already exists for this survey`,
-        details: [{ field: 'newQuestionId', value: newQuestionId }]
+        message: `Cannot duplicate: target Question ID(s) already exist: ${collisions.join(', ')}`,
+        details: collisions.map(id => ({ field: 'questionId', value: id }))
       });
     }
 
+    const remapChildren = (childrenStr) => {
+      if (!childrenStr) return '';
+      return String(childrenStr)
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(id => idMap.get(id) || id)
+        .join(', ');
+    };
+
+    const remapOptions = (opts) => {
+      if (!Array.isArray(opts)) return opts;
+      return opts.map(opt => (opt && typeof opt === 'object')
+        ? { ...opt, children: remapChildren(opt.children) }
+        : opt);
+    };
+
+    const cloneWithRemap = (origQ, overrides) => {
+      const cloned = JSON.parse(JSON.stringify(origQ));
+      cloned.options = remapOptions(cloned.options);
+      if (cloned.translations && typeof cloned.translations === 'object') {
+        for (const lang of Object.keys(cloned.translations)) {
+          const t = cloned.translations[lang];
+          if (t && typeof t === 'object') {
+            t.options = remapOptions(t.options);
+          }
+        }
+      }
+      return { ...cloned, ...overrides };
+    };
+
+    // Duplicated parent: new ID, keep child mappings (now remapped to new IDs),
+    // sourceQuestion cleared so the duplicate stands on its own at the top of
+    // its subtree.
+    const duplicatedQuestion = cloneWithRemap(originalQuestion, {
+      questionId: newQuestionId,
+      sourceQuestion: ''
+    });
+
+    // Duplicated descendants: remapped ID; sourceQuestion follows the remap so
+    // the new subtree is internally consistent.
+    const duplicatedDescendants = descendants.map(d => cloneWithRemap(d, {
+      questionId: idMap.get(d.questionId),
+      sourceQuestion: idMap.get(d.sourceQuestion) || d.sourceQuestion || ''
+    }));
+
     const currentSurvey = await getSurvey(surveyId);
-    const questions = await getQuestions(surveyId);
 
-    const validation = validator.validateQuestion(duplicatedQuestion, currentSurvey ? [currentSurvey] : [], questions);
+    // Validate the duplicated parent against a "future" snapshot that already
+    // includes the cloned descendants — that way child-mapping references resolve.
+    const futureSnapshot = [
+      ...allQuestionsBefore.filter(q => !idMap.has(q.questionId) || q.questionId === originalId),
+      duplicatedQuestion,
+      ...duplicatedDescendants
+    ];
 
-    // Since we've explicitly cleared all child references on the duplicate,
-    // any "child mapping conflict" error must come from pre-existing data
-    // (not from this duplicate). Skip that specific error class for duplicates.
+    const validation = validator.validateQuestion(
+      duplicatedQuestion,
+      currentSurvey ? [currentSurvey] : [],
+      futureSnapshot
+    );
+
     const realErrors = (validation.errors || []).filter(err => {
       const msg = typeof err === 'string' ? err : (err?.message || '');
       return !msg.includes('Child question IDs cannot be mapped to multiple');
@@ -575,7 +624,13 @@ router.post('/:surveyId/questions/:questionId/duplicate', requireWriteAccess, as
     }
 
     await upsertQuestion(duplicatedQuestion);
-    res.status(201).json(duplicatedQuestion);
+    for (const d of duplicatedDescendants) {
+      await upsertQuestion(d);
+    }
+    res.status(201).json({
+      ...duplicatedQuestion,
+      duplicatedChildren: duplicatedDescendants.map(d => d.questionId)
+    });
   } catch (error) {
     console.error('Duplicate question error:', error);
     res.status(500).json({ error: 'Failed to duplicate question', message: error.message });
