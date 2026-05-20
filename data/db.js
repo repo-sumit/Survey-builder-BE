@@ -135,11 +135,46 @@ async function initDB() {
       )
     `);
 
+    // Audit log — append-only history of mutating actions
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id           SERIAL PRIMARY KEY,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        actor_id     INT REFERENCES users(id) ON DELETE SET NULL,
+        actor_label  TEXT NOT NULL,
+        actor_role   TEXT NOT NULL,
+        state_code   TEXT,
+        action       TEXT NOT NULL,
+        entity_type  TEXT,
+        entity_id    TEXT,
+        metadata     JSONB NOT NULL DEFAULT '{}',
+        ip           TEXT,
+        user_agent   TEXT
+      )
+    `);
+
+    // Dual-auth: additive columns on users. Legacy username/password kept nullable.
+    await client.query(`ALTER TABLE users ALTER COLUMN username DROP NOT NULL`).catch(() => {});
+    await client.query(`ALTER TABLE users ALTER COLUMN password DROP NOT NULL`).catch(() => {});
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email             TEXT`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS supabase_user_id  TEXT`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS name              TEXT`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS invited_at        TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at     TIMESTAMPTZ`);
+
     // Indexes for performance
     await client.query('CREATE INDEX IF NOT EXISTS idx_surveys_state_code ON surveys(state_code)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_questions_survey_id ON questions(survey_id)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_designation_state ON designation_hierarchy(state_code)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)');
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower
+                          ON users (LOWER(email)) WHERE email IS NOT NULL`);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_supabase_id
+                          ON users (supabase_user_id) WHERE supabase_user_id IS NOT NULL`);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audit_logs_entity     ON audit_logs(entity_type, entity_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audit_logs_actor      ON audit_logs(actor_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audit_logs_state      ON audit_logs(state_code)');
 
     // Ensure new columns exist on pre-existing tables (safe to run repeatedly)
     await client.query(`
@@ -157,7 +192,7 @@ async function initDB() {
 
     await client.query('COMMIT');
 
-    // Seed admin user if env vars are set
+    // Seed admin user if env vars are set (legacy username/password path)
     const seedUser = process.env.SEED_ADMIN_USER;
     const seedPass = process.env.SEED_ADMIN_PASSWORD;
     if (seedUser && seedPass) {
@@ -169,6 +204,24 @@ async function initDB() {
           [seedUser, hash, 'admin']
         );
         console.log(`Seeded admin user: ${seedUser}`);
+      }
+    }
+
+    // Seed admin invite if email env vars are set (Google Sign-In path)
+    const seedEmail = process.env.SEED_ADMIN_EMAIL;
+    const seedName = process.env.SEED_ADMIN_NAME;
+    if (seedEmail) {
+      const existing = await pool.query(
+        'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
+        [seedEmail]
+      );
+      if (existing.rows.length === 0) {
+        await pool.query(
+          `INSERT INTO users (email, name, role, state_code, is_active, invited_at)
+           VALUES ($1, $2, 'admin', NULL, TRUE, NOW())`,
+          [seedEmail, seedName || null]
+        );
+        console.log(`Seeded admin invite: ${seedEmail}`);
       }
     }
 

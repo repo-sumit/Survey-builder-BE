@@ -2,6 +2,7 @@ const express = require('express');
 const ExcelJS = require('exceljs');
 const { pool } = require('../data/db');
 const { requireAuth, requireWriteAccess } = require('../middleware/auth');
+const { logAudit } = require('../services/audit');
 
 const router = express.Router();
 
@@ -161,8 +162,14 @@ router.post('/', requireAuth, requireWriteAccess, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,true,$6)
        RETURNING id, state_code, hierarchy_level, designation_name, medium, medium_in_english`,
       [resolvedState, hl, designation_name.trim(), medium.trim(), medium_in_english.trim(),
-        req.user.username]
+        req.user.label]
     );
+    logAudit(req, {
+      action: 'designation.create',
+      entityType: 'designation',
+      entityId: String(result.rows[0].id),
+      metadata: { state_code: resolvedState, hierarchy_level: hl }
+    });
     res.status(201).json(result.rows[0]);
   } catch (err) {
     if (err.code === '23505')
@@ -207,7 +214,7 @@ router.patch('/:id', requireAuth, requireWriteAccess, async (req, res) => {
       return res.status(400).json({ error: 'No fields to update' });
 
     setClauses.push(`updated_by=$${i++}`);
-    values.push(req.user.username);
+    values.push(req.user.label);
     setClauses.push('updated_at=NOW()');
     values.push(rowId, stateCode);
 
@@ -218,6 +225,12 @@ router.patch('/:id', requireAuth, requireWriteAccess, async (req, res) => {
         RETURNING id, state_code, hierarchy_level, designation_name, medium, medium_in_english`,
       values
     );
+    logAudit(req, {
+      action: 'designation.update',
+      entityType: 'designation',
+      entityId: String(rowId),
+      metadata: { state_code: stateCode }
+    });
     res.json(result.rows[0]);
   } catch (err) {
     if (err.code === '23505')
@@ -247,6 +260,12 @@ router.delete('/:id', requireAuth, requireWriteAccess, async (req, res) => {
     if (result.rows.length === 0)
       return res.status(404).json({ error: 'Designation not found' });
 
+    logAudit(req, {
+      action: 'designation.delete',
+      entityType: 'designation',
+      entityId: String(rowId),
+      metadata: { state_code: stateCode }
+    });
     res.json({ deleted: true });
   } catch (err) {
     console.error('Delete designation error:', err);

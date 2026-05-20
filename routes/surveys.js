@@ -4,6 +4,7 @@ const validator = require('../services/validator');
 const { readStore, writeStore, listSurveys, getSurvey, getQuestions, getQuestion, upsertSurvey, deleteSurvey: deleteSurveyRow, upsertQuestion, deleteQuestion: deleteQuestionRow } = require('../data/store');
 const { pool } = require('../data/db');
 const { requireWriteAccess } = require('../middleware/auth');
+const { logAudit } = require('../services/audit');
 
 // --- Helpers ---
 
@@ -162,6 +163,12 @@ router.post('/', requireWriteAccess, async (req, res) => {
     }
 
     await upsertSurvey(surveyData);
+    logAudit(req, {
+      action: 'survey.create',
+      entityType: 'survey',
+      entityId: surveyData.surveyId,
+      metadata: { stateCode: surveyData.stateCode }
+    });
     res.status(201).json(surveyData);
   } catch (error) {
     console.error('Survey creation error:', error);
@@ -220,6 +227,12 @@ router.put('/:id', requireWriteAccess, async (req, res) => {
     }
 
     await upsertSurvey(surveyData);
+    logAudit(req, {
+      action: 'survey.update',
+      entityType: 'survey',
+      entityId: surveyData.surveyId,
+      metadata: { stateCode: surveyData.stateCode }
+    });
     res.json(surveyData);
   } catch (error) {
     console.error('Survey update error:', error);
@@ -244,6 +257,11 @@ router.delete('/:id', requireWriteAccess, async (req, res) => {
     }
 
     await deleteSurveyRow(req.params.id); // CASCADE deletes questions
+    logAudit(req, {
+      action: 'survey.delete',
+      entityType: 'survey',
+      entityId: req.params.id
+    });
     res.json({ message: 'Survey deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete survey', message: error.message });
@@ -331,6 +349,12 @@ router.post('/:id/questions', requireWriteAccess, async (req, res) => {
     }
 
     await upsertQuestion(questionData);
+    logAudit(req, {
+      action: 'question.create',
+      entityType: 'question',
+      entityId: `${questionData.surveyId}/${questionData.questionId}`,
+      metadata: { questionType: questionData.questionType }
+    });
     res.status(201).json(questionData);
   } catch (error) {
     console.error('Question creation error:', error);
@@ -383,6 +407,11 @@ router.put('/:id/questions/:questionId', requireWriteAccess, async (req, res) =>
     }
 
     await upsertQuestion(questionData);
+    logAudit(req, {
+      action: 'question.update',
+      entityType: 'question',
+      entityId: `${questionData.surveyId}/${questionData.questionId}`
+    });
     res.json(questionData);
   } catch (error) {
     console.error('Question update error:', error);
@@ -411,6 +440,11 @@ router.delete('/:id/questions/:questionId', requireWriteAccess, async (req, res)
     if (!existingQ) return res.status(404).json({ error: 'Question not found' });
 
     await deleteQuestionRow(req.params.id, req.params.questionId);
+    logAudit(req, {
+      action: 'question.delete',
+      entityType: 'question',
+      entityId: `${req.params.id}/${req.params.questionId}`
+    });
     res.json({ message: 'Question deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete question', message: error.message });
@@ -723,9 +757,16 @@ router.post('/:id/publish', requireWriteAccess, async (req, res) => {
     survey.publish = {
       status: 'PUBLISHED',
       publishedAt: new Date().toISOString(),
-      publishedBy: req.user.username
+      publishedBy: req.user.label
     };
     await upsertSurvey(survey);
+
+    logAudit(req, {
+      action: 'survey.publish',
+      entityType: 'survey',
+      entityId: survey.surveyId,
+      metadata: { publishedAt: survey.publish.publishedAt }
+    });
 
     res.json({ message: 'Survey published', publish: survey.publish });
   } catch (error) {
@@ -746,6 +787,12 @@ router.post('/:id/unpublish', async (req, res) => {
 
     survey.publish = { status: 'DRAFT' };
     await upsertSurvey(survey);
+
+    logAudit(req, {
+      action: 'survey.unpublish',
+      entityType: 'survey',
+      entityId: survey.surveyId
+    });
 
     res.json({ message: 'Survey unpublished', publish: survey.publish });
   } catch (error) {

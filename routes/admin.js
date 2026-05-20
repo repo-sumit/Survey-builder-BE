@@ -2,23 +2,38 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const { pool } = require('../data/db');
 const { requireWriteAccess } = require('../middleware/auth');
+const {
+  listUsers,
+  findUserById,
+  findUserByEmail,
+  insertUserInvite,
+  updateUserProfile,
+  attachEmailToUser
+} = require('../data/store');
+const { logAudit } = require('../services/audit');
 
 const router = express.Router();
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // GET /api/admin/users - List all users
 router.get('/users', async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT id, username, role, state_code, is_active, created_at, updated_at FROM users ORDER BY created_at'
-    );
-    res.json(result.rows.map(r => ({
-      id: r.id,
-      username: r.username,
-      role: r.role,
-      stateCode: r.state_code,
-      isActive: r.is_active,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at
+    const users = await listUsers();
+    res.json(users.map(u => ({
+      id: u.id,
+      username: u.username,
+      email: u.email,
+      name: u.name,
+      role: u.role,
+      stateCode: u.stateCode,
+      isActive: u.isActive,
+      supabaseUserId: u.supabaseUserId,
+      authSource: u.email ? (u.username ? 'both' : 'google') : (u.username ? 'legacy' : 'none'),
+      invitedAt: u.invitedAt,
+      lastLoginAt: u.lastLoginAt,
+      createdAt: u.createdAt,
+      updatedAt: u.updatedAt
     })));
   } catch (err) {
     console.error('List users error:', err);
@@ -26,28 +41,53 @@ router.get('/users', async (req, res) => {
   }
 });
 
-// POST /api/admin/users - Create user
+// POST /api/admin/users
+// Two shapes accepted (dual-auth window):
+//   1) Invite by email (preferred):  { email, name, role, stateCode }
+//   2) Legacy create:                { username, password, role, stateCode }
 router.post('/users', requireWriteAccess, async (req, res) => {
   try {
-    const { username, password, role, stateCode } = req.body;
-
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password are required' });
-    }
+    const { email, name, username, password, role, stateCode } = req.body;
 
     if (!['admin', 'state'].includes(role)) {
       return res.status(400).json({ error: 'Role must be "admin" or "state"' });
     }
-
     if (role === 'state' && !stateCode) {
       return res.status(400).json({ error: 'State code is required for state users' });
     }
 
-    const existing = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
-    if (existing.rows.length > 0) {
-      return res.status(400).json({ error: 'Username already exists' });
+    // Invite path
+    if (email) {
+      if (!EMAIL_RE.test(email)) {
+        return res.status(400).json({ error: 'Invalid email address' });
+      }
+      const existing = await findUserByEmail(email);
+      if (existing) {
+        return res.status(409).json({ error: 'A user with that email already exists' });
+      }
+      const profile = await insertUserInvite({
+        email: email.toLowerCase(),
+        name,
+        role,
+        stateCode: role === 'admin' ? null : stateCode
+      });
+      logAudit(req, {
+        action: 'user.invite',
+        entityType: 'user',
+        entityId: String(profile.id),
+        metadata: { email: profile.email, role: profile.role, stateCode: profile.stateCode }
+      });
+      return res.status(201).json(profile);
     }
 
+    // Legacy create path (kept for dual-auth window)
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Provide email + name (invite) or username + password (legacy)' });
+    }
+    const existingLegacy = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+    if (existingLegacy.rows.length > 0) {
+      return res.status(400).json({ error: 'Username already exists' });
+    }
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query(
       `INSERT INTO users (username, password, role, state_code, is_active)
@@ -55,8 +95,13 @@ router.post('/users', requireWriteAccess, async (req, res) => {
        RETURNING id, username, role, state_code, is_active, created_at`,
       [username, hash, role, role === 'admin' ? null : stateCode]
     );
-
     const user = result.rows[0];
+    logAudit(req, {
+      action: 'user.create.legacy',
+      entityType: 'user',
+      entityId: String(user.id),
+      metadata: { username: user.username, role: user.role, stateCode: user.state_code }
+    });
     res.status(201).json({
       id: user.id,
       username: user.username,
@@ -71,70 +116,90 @@ router.post('/users', requireWriteAccess, async (req, res) => {
   }
 });
 
-// PATCH /api/admin/users/:id - Update user (toggle active, reset password, change stateCode)
+// PATCH /api/admin/users/:id
+// Accepts: { name, role, stateCode, isActive, password }
+// `password` is only used to reset legacy users' passwords. It is rejected for invite-only users.
 router.patch('/users/:id', requireWriteAccess, async (req, res) => {
   try {
     const userId = parseInt(req.params.id, 10);
-    const { password, isActive, stateCode, role } = req.body;
+    const { password, isActive, stateCode, role, name } = req.body;
 
-    const existing = await pool.query('SELECT id, username, role FROM users WHERE id = $1', [userId]);
-    if (existing.rows.length === 0) {
+    const existing = await findUserById(userId);
+    if (!existing) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const updates = [];
-    const values = [];
-    let paramIdx = 1;
+    if (role !== undefined && !['admin', 'state'].includes(role)) {
+      return res.status(400).json({ error: 'Role must be "admin" or "state"' });
+    }
 
+    // Update profile fields via the helper.
+    const profileUpdates = {};
+    if (name !== undefined)      profileUpdates.name = name;
+    if (role !== undefined)      profileUpdates.role = role;
+    if (stateCode !== undefined) profileUpdates.stateCode = (role === 'admin' || existing.role === 'admin') ? null : stateCode;
+    if (isActive !== undefined)  profileUpdates.isActive = isActive;
+
+    let updated = existing;
+    if (Object.keys(profileUpdates).length > 0) {
+      updated = await updateUserProfile(userId, profileUpdates);
+    }
+
+    // Optional legacy password reset (only meaningful while username is set)
     if (password !== undefined) {
-      const hash = await bcrypt.hash(password, 10);
-      updates.push(`password = $${paramIdx++}`);
-      values.push(hash);
-    }
-
-    if (isActive !== undefined) {
-      updates.push(`is_active = $${paramIdx++}`);
-      values.push(isActive);
-    }
-
-    if (stateCode !== undefined) {
-      updates.push(`state_code = $${paramIdx++}`);
-      values.push(stateCode || null);
-    }
-
-    if (role !== undefined) {
-      if (!['admin', 'state'].includes(role)) {
-        return res.status(400).json({ error: 'Role must be "admin" or "state"' });
+      if (!existing.username) {
+        return res.status(400).json({ error: 'Cannot set password on an invite-only user' });
       }
-      updates.push(`role = $${paramIdx++}`);
-      values.push(role);
+      const hash = await bcrypt.hash(password, 10);
+      await pool.query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [hash, userId]);
     }
 
-    if (updates.length === 0) {
-      return res.status(400).json({ error: 'No fields to update' });
-    }
-
-    updates.push(`updated_at = NOW()`);
-    values.push(userId);
-
-    const result = await pool.query(
-      `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIdx}
-       RETURNING id, username, role, state_code, is_active, updated_at`,
-      values
-    );
-
-    const user = result.rows[0];
-    res.json({
-      id: user.id,
-      username: user.username,
-      role: user.role,
-      stateCode: user.state_code,
-      isActive: user.is_active,
-      updatedAt: user.updated_at
+    logAudit(req, {
+      action: 'user.update',
+      entityType: 'user',
+      entityId: String(userId),
+      metadata: {
+        changed: Object.keys(profileUpdates),
+        passwordReset: password !== undefined
+      }
     });
+
+    res.json(updated);
   } catch (err) {
     console.error('Update user error:', err);
     res.status(500).json({ error: 'Failed to update user', message: err.message });
+  }
+});
+
+// POST /api/admin/users/:id/attach-email
+// Backfill an email + name on a legacy user so they can switch to Google sign-in.
+router.post('/users/:id/attach-email', requireWriteAccess, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id, 10);
+    const { email, name } = req.body;
+    if (!email || !EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: 'Valid email is required' });
+    }
+    const existing = await findUserById(userId);
+    if (!existing) return res.status(404).json({ error: 'User not found' });
+    if (existing.email) {
+      return res.status(409).json({ error: 'User already has an email' });
+    }
+    const conflict = await findUserByEmail(email);
+    if (conflict) {
+      return res.status(409).json({ error: 'Another user already has that email' });
+    }
+    const updated = await attachEmailToUser(userId, { email: email.toLowerCase(), name });
+    logAudit(req, {
+      action: 'user.attach_email',
+      entityType: 'user',
+      entityId: String(userId),
+      metadata: { email: updated.email }
+    });
+    res.json(updated);
+  } catch (err) {
+    console.error('Attach email error:', err);
+    res.status(500).json({ error: 'Failed to attach email', message: err.message });
   }
 });
 
@@ -169,6 +234,12 @@ router.post('/state-config', requireWriteAccess, async (req, res) => {
        RETURNING *`,
       [state_code.trim(), state_name.trim(), (available_languages || '').trim()]
     );
+    logAudit(req, {
+      action: 'state_config.upsert',
+      entityType: 'state_config',
+      entityId: state_code.trim(),
+      metadata: { state_name }
+    });
     res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error('Create state config error:', err);
@@ -201,6 +272,11 @@ router.patch('/state-config/:state_code', requireWriteAccess, async (req, res) =
       `UPDATE state_config SET ${setClauses.join(', ')} WHERE state_code=$${i} RETURNING *`,
       values
     );
+    logAudit(req, {
+      action: 'state_config.update',
+      entityType: 'state_config',
+      entityId: state_code
+    });
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Update state config error:', err);
@@ -218,6 +294,11 @@ router.delete('/state-config/:state_code', requireWriteAccess, async (req, res) 
     );
     if (result.rows.length === 0)
       return res.status(404).json({ error: 'State config not found' });
+    logAudit(req, {
+      action: 'state_config.delete',
+      entityType: 'state_config',
+      entityId: state_code
+    });
     res.json({ deleted: true });
   } catch (err) {
     console.error('Delete state config error:', err);

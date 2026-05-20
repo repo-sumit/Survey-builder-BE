@@ -180,6 +180,158 @@ async function writeStore(data) {
   }
 }
 
+/* ── User & audit helpers (dual-auth) ─────────────────────────────────── */
+
+function userRowToProfile(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    username: r.username || null,
+    email: r.email || null,
+    name: r.name || null,
+    role: r.role,
+    stateCode: r.state_code,
+    isActive: r.is_active,
+    supabaseUserId: r.supabase_user_id || null,
+    invitedAt: r.invited_at || null,
+    lastLoginAt: r.last_login_at || null,
+    createdAt: r.created_at || null,
+    updatedAt: r.updated_at || null,
+    label: r.email || r.username || `#${r.id}`
+  };
+}
+
+async function findUserByEmail(email) {
+  if (!email) return null;
+  const { rows } = await pool.query(
+    `SELECT id, username, email, name, role, state_code, is_active,
+            supabase_user_id, invited_at, last_login_at, created_at, updated_at
+       FROM users
+      WHERE LOWER(email) = LOWER($1)
+      LIMIT 1`,
+    [email]
+  );
+  return userRowToProfile(rows[0]);
+}
+
+async function findUserById(id) {
+  if (!id) return null;
+  const { rows } = await pool.query(
+    `SELECT id, username, email, name, role, state_code, is_active,
+            supabase_user_id, invited_at, last_login_at, created_at, updated_at
+       FROM users
+      WHERE id = $1
+      LIMIT 1`,
+    [id]
+  );
+  return userRowToProfile(rows[0]);
+}
+
+async function findUserBySupabaseId(supabaseUserId) {
+  if (!supabaseUserId) return null;
+  const { rows } = await pool.query(
+    `SELECT id, username, email, name, role, state_code, is_active,
+            supabase_user_id, invited_at, last_login_at, created_at, updated_at
+       FROM users
+      WHERE supabase_user_id = $1
+      LIMIT 1`,
+    [supabaseUserId]
+  );
+  return userRowToProfile(rows[0]);
+}
+
+async function insertUserInvite({ email, name, role, stateCode }) {
+  const { rows } = await pool.query(
+    `INSERT INTO users (email, name, role, state_code, is_active, invited_at)
+     VALUES ($1, $2, $3, $4, TRUE, NOW())
+     RETURNING id, username, email, name, role, state_code, is_active,
+               supabase_user_id, invited_at, last_login_at, created_at, updated_at`,
+    [email.trim(), name ? name.trim() : null, role, role === 'admin' ? null : stateCode]
+  );
+  return userRowToProfile(rows[0]);
+}
+
+async function updateUserProfile(id, { name, role, stateCode, isActive }) {
+  const sets = [];
+  const vals = [];
+  let i = 1;
+  if (name !== undefined)      { sets.push(`name = $${i++}`);       vals.push(name); }
+  if (role !== undefined)      { sets.push(`role = $${i++}`);       vals.push(role); }
+  if (stateCode !== undefined) { sets.push(`state_code = $${i++}`); vals.push(stateCode || null); }
+  if (isActive !== undefined)  { sets.push(`is_active = $${i++}`);  vals.push(isActive); }
+  if (sets.length === 0) return await findUserById(id);
+  sets.push(`updated_at = NOW()`);
+  vals.push(id);
+  const { rows } = await pool.query(
+    `UPDATE users SET ${sets.join(', ')} WHERE id = $${i}
+     RETURNING id, username, email, name, role, state_code, is_active,
+               supabase_user_id, invited_at, last_login_at, created_at, updated_at`,
+    vals
+  );
+  return userRowToProfile(rows[0]);
+}
+
+async function attachEmailToUser(id, { email, name }) {
+  const { rows } = await pool.query(
+    `UPDATE users
+        SET email = COALESCE(email, $1),
+            name  = COALESCE(name, $2),
+            invited_at = COALESCE(invited_at, NOW()),
+            updated_at = NOW()
+      WHERE id = $3
+      RETURNING id, username, email, name, role, state_code, is_active,
+                supabase_user_id, invited_at, last_login_at, created_at, updated_at`,
+    [email.trim(), name ? name.trim() : null, id]
+  );
+  return userRowToProfile(rows[0]);
+}
+
+async function touchUserLastLogin(id, supabaseUserId) {
+  await pool.query(
+    `UPDATE users
+        SET last_login_at = NOW(),
+            supabase_user_id = COALESCE(supabase_user_id, $2),
+            updated_at = NOW()
+      WHERE id = $1`,
+    [id, supabaseUserId || null]
+  );
+}
+
+async function listUsers() {
+  const { rows } = await pool.query(
+    `SELECT id, username, email, name, role, state_code, is_active,
+            supabase_user_id, invited_at, last_login_at, created_at, updated_at
+       FROM users
+      ORDER BY created_at`
+  );
+  return rows.map(userRowToProfile);
+}
+
+async function insertAuditLog({
+  actorId, actorLabel, actorRole, stateCode,
+  action, entityType, entityId, metadata,
+  ip, userAgent
+}) {
+  await pool.query(
+    `INSERT INTO audit_logs
+       (actor_id, actor_label, actor_role, state_code, action,
+        entity_type, entity_id, metadata, ip, user_agent)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [
+      actorId || null,
+      actorLabel || 'unknown',
+      actorRole || 'unknown',
+      stateCode || null,
+      action,
+      entityType || null,
+      entityId || null,
+      metadata ? JSON.stringify(metadata) : '{}',
+      ip || null,
+      userAgent || null
+    ]
+  );
+}
+
 module.exports = {
   STORE_PATH,
   UPLOAD_DIR,
@@ -196,5 +348,16 @@ module.exports = {
   upsertSurvey,
   deleteSurvey,
   upsertQuestion,
-  deleteQuestion
+  deleteQuestion,
+  // Users & audit (dual-auth)
+  findUserByEmail,
+  findUserById,
+  findUserBySupabaseId,
+  insertUserInvite,
+  updateUserProfile,
+  attachEmailToUser,
+  touchUserLastLogin,
+  listUsers,
+  insertAuditLog,
+  userRowToProfile
 };

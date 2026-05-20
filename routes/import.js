@@ -6,6 +6,7 @@ const { parse } = require('csv-parse/sync');
 const path = require('path');
 const validator = require('../services/validator');
 const { upsertSurvey, upsertQuestion, findExistingSurveyIds, deleteSurvey } = require('../data/store');
+const { logAudit } = require('../services/audit');
 
 const parsedMaxImportSizeMb = Number(process.env.IMPORT_MAX_FILE_SIZE_MB);
 const MAX_IMPORT_FILE_SIZE_MB = Number.isFinite(parsedMaxImportSizeMb) && parsedMaxImportSizeMb > 0
@@ -877,6 +878,18 @@ router.post('/', importUploadMiddleware, async (req, res) => {
 
     await runInBatches(importData.surveys, UPSERT_BATCH_SIZE, (survey) => upsertSurvey(survey));
     await runInBatches(importData.questions, UPSERT_BATCH_SIZE, (question) => upsertQuestion(question));
+
+    logAudit(req, {
+      action: 'import.commit',
+      entityType: 'import',
+      entityId: null,
+      metadata: {
+        overwrite,
+        surveysImported: importData.surveys.length,
+        questionsImported: importData.questions.length,
+        surveyIds: importData.surveys.map(s => s.surveyId)
+      }
+    });
 
     res.status(201).json({
       message: 'Import successful',

@@ -6,6 +6,7 @@ const {
   generateAccessSheetXlsx,
   parseAccessSheetXlsx
 } = require('../services/accessSheetUtils');
+const { logAudit } = require('../services/audit');
 
 const router = express.Router();
 
@@ -65,13 +66,20 @@ router.post('/dump', requireAuth, async (req, res) => {
          summary    = $6`,
       [
         stateCode,
-        req.user.username,
+        req.user.label,
         fileName,
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         fileBytes,
         JSON.stringify(summary)
       ]
     );
+
+    logAudit(req, {
+      action: 'access_sheet.dump',
+      entityType: 'access_sheet',
+      entityId: stateCode,
+      metadata: summary
+    });
 
     res.json({
       success: true,
