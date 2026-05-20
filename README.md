@@ -1,343 +1,172 @@
 # Survey Builder Backend (`fmb-survey-builder-server`)
 
-Node.js + Express REST API that powers the **FMB Survey Builder** platform. It owns:
+Node 18 + Express REST API for the FMB Survey Builder. PostgreSQL persistence (JSONB-first), JWT auth, RBAC, 15-min edit locks, Excel/CSV import-export, validation engine, translation proxy.
 
-- **Authentication & RBAC** (JWT, admin vs state, active vs inactive).
-- **Survey + Question persistence** (PostgreSQL JSONB).
-- **Concurrency control** (15-minute survey edit locks).
-- **Excel/CSV import + export pipelines** (with a two-phase preview/commit flow and a read-only Dumpsheet Validator).
-- **Validation engine** for survey payloads and uploaded files (single source of truth).
-- **Supporting masters** — designation hierarchy, latest access-sheet dump, state config.
-- **Translation proxy** to LibreTranslate.
-
-> **Companion service**: the React frontend in [`../Survey-builder-FE`](../Survey-builder-FE).
-> **Project-wide overview**: see the [root README](../README.md).
+> Project-wide overview & glossary: [root README](../README.md).
+> Companion service: [`../Survey-builder-FE`](../Survey-builder-FE).
 
 ---
 
-## Table of Contents
+## 1. Stack
 
-1. [Overview](#overview)
-2. [Key Features](#key-features)
-3. [Tech Stack](#tech-stack)
-4. [Repository Structure](#repository-structure)
-5. [Architecture](#architecture)
-6. [Application Logic](#application-logic)
-7. [API Documentation](#api-documentation)
-8. [Database / Data Model](#database--data-model)
-9. [Environment Variables](#environment-variables)
-10. [Installation & Local Setup](#installation--local-setup)
-11. [Running the Project](#running-the-project)
-12. [Testing](#testing)
-13. [Deployment](#deployment)
-14. [Security & Permissions](#security--permissions)
-15. [Error Handling & Logging](#error-handling--logging)
-16. [Known Constraints](#known-constraints)
-17. [Future Improvements](#future-improvements)
-18. [Contribution Guidelines](#contribution-guidelines)
+| Concern | Library | Version | Notes |
+|---|---|---|---|
+| Runtime | Node.js | 18+ (16 min) | |
+| Web | `express` | 4.18 | Single app, all routes under `/api` |
+| DB driver | `pg` | 8 | Pool: `max=10` local / `max=2` on Vercel |
+| Auth | `jsonwebtoken` | 9 | 24 h expiry |
+| Hashing | `bcryptjs` | 3 | 10 rounds |
+| Uploads | `multer` | 1.4.5-lts | Disk to `uploads/`, default 10 MB cap |
+| XLSX | `exceljs` | 4.4 | Workbook buffered in memory (see Limits) |
+| CSV | `csv-parse` | 5.5 | |
+| Compression | `compression` | 1.8 | gzip all responses |
+| Config | `dotenv` | 17 | `.env` at project root |
+| Dev | `nodemon` | 3 | `npm run dev` |
+
+**Not configured:** ESLint, Prettier, Jest/Mocha, structured logger, migration tool.
 
 ---
 
-## Overview
+## 2. Feature → Limit Map
 
-A single Express app exposes everything under `/api`. Data is stored in a PostgreSQL database that the service initialises itself on first boot — no separate migration tool is required.
-
-The backend supports two deployment styles out of the box:
-- **Vercel serverless** — `vercel.json` rewrites every request to `app.js`, plus a daily cron pings `/api/keep-alive` to keep cloud Postgres providers from auto-pausing.
-- **Long-lived Node process** — when `process.env.VERCEL` is unset, `app.listen(PORT)` runs as expected (Render-style hosting).
-
----
-
-## Key Features
-
-- **JWT auth** with bcrypt-hashed passwords. 24-hour token lifetime.
-- **Role-based access control** — `admin` (global) vs `state` (own state, write-gated by `is_active`).
-- **State-scoped reads/writes** — non-admins only see surveys whose `state_code` matches their user.
-- **Survey + Question CRUD** with idempotent upserts.
-- **15-minute concurrency locks** with auto-cleanup; `409` on conflict.
-- **Subtree-aware question duplication** — duplicating `Q2.1` as `Q3` clones `Q2.1.1 → Q3.1`, `Q2.1.2 → Q3.2`, including `OptionXChildren` references.
-- **Excel/CSV import** — three modes:
-  - `POST /api/import/preview` — parse + validate, return everything, persist nothing.
-  - `POST /api/import` — parse + validate + persist (optional `surveyIds=` filter, optional `overwrite=true`).
-  - `POST /api/import/validate-dump` — parse + validate; return errors only for rows whose `Mode` is `Correction` or `New Data`. Persists nothing.
-- **Excel export** — single-survey XLSX dump via `GET /api/export/:surveyId`.
-- **Validation engine** — `validation/validationEngine.js` is the canonical rule set, used by CRUD, duplicate, and all import flows.
-- **Designation hierarchy** — per-state, per-language CRUD with seed defaults and XLSX export.
-- **Access sheet dump** — XLSX BLOB persisted in `access_sheet_latest_dump`, downloadable via the API.
-- **Translation proxy** — `POST /api/translate` proxies to LibreTranslate (configurable URL/key/timeout).
-- **Publish / Unpublish** — feature-flagged; admins only for unpublish.
-- **Auto SSL detection** — Postgres SSL turns on automatically for popular cloud providers (Supabase, Neon, Railway, Render, Cockroach, Cloud SQL) or when `NODE_ENV=production`.
-- **Vercel keep-alive cron** — `0 8 * * *` daily ping prevents free-tier database pauses.
+| # | Feature | Endpoint(s) | Limit / Caveat |
+|---|---|---|---|
+| 1 | **JWT login** | `POST /api/auth/login` | 24 h tokens. No refresh. No password reset endpoint. |
+| 2 | **RBAC** | `requireAuth` / `requireAdmin` / `requireWriteAccess` | Three middleware tiers. No per-resource ACLs. |
+| 3 | **State-scoped reads** | All survey/question reads | Non-admin: filtered by `req.user.stateCode`. Admin: no filter. |
+| 4 | **Survey CRUD** | `GET/POST/PUT/DELETE /api/surveys/:id?` | `survey_id` regex `^[A-Za-z0-9_]+$`. Cascade-deletes questions + locks. |
+| 5 | **Question CRUD** | `… /surveys/:id/questions/:qId?` | Composite PK `(survey_id, question_id)`. 12 types. |
+| 6 | **Subtree duplication** | `POST /api/surveys/:id/questions/:qId/duplicate` | Remaps `OptionXChildren` and `sourceQuestion`. Collisions → `400` with list. |
+| 7 | **Survey duplicate** | `POST /api/surveys/:id/duplicate` | Clones survey row + (optional) all questions. |
+| 8 | **Concurrency locks** | `POST/GET/DELETE /api/surveys/:id/lock` | 15-min TTL. `PUT /surveys/:id` returns `409 { lockOwner }` on conflict. Lazy cleanup. |
+| 9 | **Publish / Unpublish** | `POST /api/surveys/:id/publish`, `…/unpublish` | Gated by `FEATURE_PUBLISH=true`. Unpublish is **admin-only**. Question mutations blocked while `PUBLISHED`. |
+| 10 | **Import — preview** | `POST /api/import/preview` | Returns `{surveys, questions, validationErrors}`. Persists nothing. |
+| 11 | **Import — commit** | `POST /api/import?surveyIds=A,B&overwrite=true` | Default caps: 10 MB / 10 000 rows. Batched upserts (25 at a time). |
+| 12 | **Dumpsheet Validator** | `POST /api/import/validate-dump` | Errors only for rows where `Mode ∈ {New Data, Correction}`. Persists nothing. |
+| 13 | **Excel Export** | `GET /api/export/:surveyId` | Buffers full workbook in memory (no streaming). |
+| 14 | **Designation hierarchy** | `GET/POST/PATCH/DELETE /api/designations`, `/export`, `/seed-defaults` | UNIQUE `(state_code, medium_in_english, hierarchy_level)`. |
+| 15 | **Access Sheet dump** | `POST /api/access-sheet/dump`, `GET /latest`, `GET /latest/download`, `POST /validate` | One row per state. File stored as `BYTEA` — heavy at scale. |
+| 16 | **Translation proxy** | `POST /api/translate` | Default backend `libretranslate.de`. 10 s timeout. Optional API key. |
+| 17 | **Validation engine** | `GET /api/validation-schema`, `POST /api/validate-upload` | Single source of truth in `validation/validationEngine.js`. |
+| 18 | **Keep-alive cron** | `GET /api/keep-alive` | Daily `0 8 * * *` from `vercel.json`. Defends free-tier DB auto-pause. |
+| 19 | **Health check** | `GET /api/health` | Public. |
+| 20 | **Lazy DB init** | n/a (middleware) | First request triggers `initDB()`; failures return `503`. |
 
 ---
 
-## Tech Stack
-
-| Concern | Library |
-|---|---|
-| Runtime | Node.js 18+ |
-| Framework | Express 4.18 |
-| Database | PostgreSQL via `pg` 8 (JSONB columns) |
-| Auth | `jsonwebtoken` |
-| Hashing | `bcryptjs` |
-| Uploads | `multer` (10 MB default cap) |
-| XLSX | `exceljs` |
-| CSV | `csv-parse` |
-| Compression | `compression` (gzip) |
-| Config | `dotenv` |
-| Dev | `nodemon` |
-
-No test framework or linter is configured today.
-
----
-
-## Repository Structure
+## 3. File Tree
 
 ```
 Survey-builder-BE/
-├── app.js                        # Express bootstrap + route mounting + lazy DB init
-├── package.json                  # Scripts (start, dev) + dependencies
-├── vercel.json                   # Serverless rewrites + daily keep-alive cron
+├── app.js                            # Express bootstrap; CORS+gzip+bodyParser; lazy initDB middleware; route mount; error handler
+├── package.json                      # scripts: start, dev
+├── vercel.json                       # serverless: rewrites /(.*)/ → app.js; cron /api/keep-alive @ 0 8 * * *
 │
 ├── data/
-│   ├── db.js                     # pg.Pool, idempotent initDB(), admin seed, SSL auto-detect
-│   └── store.js                  # All SQL: surveys/questions/locks CRUD, helpers
+│   ├── db.js                         # pg.Pool, SSL auto-detect, initDB() DDL, admin seed
+│   └── store.js                      # ALL SQL — surveys/questions/locks/users/designations/state_config/access_sheet helpers
 │
 ├── middleware/
-│   └── auth.js                   # requireAuth, requireAdmin, requireWriteAccess
+│   └── auth.js                       # requireAuth (JWT verify + attach req.user), requireAdmin, requireWriteAccess
 │
 ├── routes/
-│   ├── auth.js                   # POST /auth/login
-│   ├── surveys.js                # Surveys + questions CRUD, locking, publish, duplication
-│   ├── admin.js                  # User & state-config admin CRUD
-│   ├── export.js                 # GET /export/:surveyId → XLSX
-│   ├── import.js                 # /import, /import/preview, /import/validate-dump
-│   ├── validateUpload.js         # POST /validate-upload (legacy/standalone validator)
-│   ├── validationSchema.js       # GET /validation-schema → schema JSON for the FE
-│   ├── translate.js              # POST /translate (LibreTranslate proxy)
-│   ├── designations.js           # Designation hierarchy CRUD + XLSX export + seed
-│   └── accessSheet.js            # Access sheet dump/upload/download
+│   ├── auth.js                       # POST /login
+│   ├── surveys.js                    # surveys + questions CRUD + lock + duplicate + publish/unpublish (16 endpoints)
+│   ├── admin.js                      # users + state-config CRUD
+│   ├── designations.js               # GET, GET /export, POST /seed-defaults, POST, PATCH /:id, DELETE /:id
+│   ├── accessSheet.js                # POST /dump, GET /latest, GET /latest/download, POST /validate
+│   ├── import.js                     # POST / (commit), POST /preview, POST /validate-dump  (multer middleware)
+│   ├── export.js                     # GET /:surveyId → XLSX stream
+│   ├── validateUpload.js             # POST / — standalone upload validator
+│   ├── validationSchema.js           # GET / — returns validation rules JSON (drives FE)
+│   └── translate.js                  # POST / — LibreTranslate proxy
 │
 ├── services/
-│   ├── validator.js              # Thin facade over validationEngine.js
-│   ├── excelGenerator.js         # ExcelJS workbook generation for export
-│   └── accessSheetUtils.js       # Helpers used by accessSheet route
+│   ├── validator.js                  # Thin facade over validationEngine
+│   ├── excelGenerator.js             # ExcelJS workbook builder (one row per language via `translations`)
+│   └── accessSheetUtils.js           # Access-sheet XLSX parsing/validation helpers
 │
-├── schemas/validationRules.js    # Constants/enums (question types, modes, etc.)
-├── validation/validationEngine.js# Canonical validation rules — single source of truth
-├── uploads/                      # Runtime upload staging (gitignored)
-└── README.md                     # this file
+├── schemas/
+│   └── validationRules.js            # Question-type enum, mode enum, regex constants
+│
+├── validation/
+│   └── validationEngine.js           # Canonical rules (CRUD + 3 import endpoints share this)
+│
+└── uploads/                          # Multer disk staging (gitignored, runtime only)
 ```
 
 ---
 
-## Architecture
+## 4. Database Schema
 
-### Layering
+DDL is in [`data/db.js`](./data/db.js) (idempotent, runs on first request). All SQL is parameterised and lives in [`data/store.js`](./data/store.js).
 
-```
-HTTP request
-  → middleware/auth.js     (JWT verify, role gating)
-  → routes/<domain>.js     (input parsing + response shape)
-  → services/validator.js  → validation/validationEngine.js
-  → data/store.js          (parameterised SQL only)
-  → pg Pool                (PostgreSQL)
-```
+### 4.1 Tables
 
-### Request lifecycle
+```sql
+-- surveys
+survey_id   TEXT PRIMARY KEY
+state_code  TEXT                 -- nullable; null = admin-owned / unscoped
+data        JSONB NOT NULL       -- full survey doc
+publish     JSONB NOT NULL DEFAULT '{"status":"DRAFT"}'
+created_at  TIMESTAMPTZ DEFAULT NOW()
+updated_at  TIMESTAMPTZ DEFAULT NOW()
 
-1. `app.js` initialises `cors`, `compression`, `body-parser`.
-2. A custom middleware lazily runs `initStore()` on the first request to handle Vercel cold starts.
-3. Public routes: `GET /api/health`, `GET /api/keep-alive`, `POST /api/auth/login`.
-4. All other routes pass through `requireAuth`; admin-only ones add `requireAdmin`; write-protected ones add `requireWriteAccess`.
-5. Routes call helpers in `data/store.js` — no SQL is embedded in route files.
-6. Mutations validate via `validation/validationEngine.js`. Surveys CRUD adds a lock check on `PUT`.
+-- questions
+survey_id   TEXT NOT NULL REFERENCES surveys(survey_id) ON DELETE CASCADE
+question_id TEXT NOT NULL                  -- ^Q\d+(\.\d+)*$
+data        JSONB NOT NULL
+created_at  TIMESTAMPTZ DEFAULT NOW()
+updated_at  TIMESTAMPTZ DEFAULT NOW()
+PRIMARY KEY (survey_id, question_id)
 
-### Lazy DB initialisation
+-- users
+id          SERIAL PRIMARY KEY
+username    TEXT UNIQUE NOT NULL
+password    TEXT NOT NULL                  -- bcrypt hash
+role        TEXT NOT NULL DEFAULT 'state'  -- 'admin' | 'state'
+state_code  TEXT                            -- null for admins
+is_active   BOOLEAN NOT NULL DEFAULT TRUE
+created_at  TIMESTAMPTZ DEFAULT NOW()
+updated_at  TIMESTAMPTZ DEFAULT NOW()
 
-`app.js` keeps a process-level `dbInitPromise` so that the first request triggers `initStore()` once on cold-start. Subsequent requests skip it. Initialisation failures return `503 { error: 'Database unavailable' }`.
+-- survey_locks
+survey_id   TEXT PRIMARY KEY REFERENCES surveys(survey_id) ON DELETE CASCADE
+locked_by   INTEGER NOT NULL REFERENCES users(id)
+locked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+expires_at  TIMESTAMPTZ NOT NULL            -- locked_at + 15 min
 
----
+-- designation_hierarchy
+id                 SERIAL PRIMARY KEY
+state_code         TEXT NOT NULL
+designation_id     INT                       -- nullable (relaxed via migration)
+hierarchy_level    INT  NOT NULL
+designation_name   TEXT NOT NULL
+medium             TEXT NOT NULL             -- native language
+medium_in_english  TEXT NOT NULL
+is_active          BOOLEAN DEFAULT TRUE
+created_by         TEXT
+updated_by         TEXT
+created_at         TIMESTAMPTZ DEFAULT NOW()
+updated_at         TIMESTAMPTZ DEFAULT NOW()
+UNIQUE (state_code, medium_in_english, hierarchy_level)
 
-## Application Logic
+-- state_config
+state_code           TEXT PRIMARY KEY
+state_name           TEXT NOT NULL
+available_languages  TEXT NOT NULL DEFAULT '' -- CSV string, e.g. "English,Hindi"
 
-### Survey identity & state scope
-- `surveys.survey_id` is the primary key. `state_code` is nullable but enforced for non-admin reads/writes.
-- `verifySurveyAccess(survey, user)` returns `false` for state users whose `stateCode` doesn't match `survey.stateCode`; routes return `403`.
-
-### Question identity
-- Composite primary key: `(survey_id, question_id)`.
-- `question_id` must match `^Q\d+(\.\d+)*$`. Dots indicate child relationships.
-- Child question's `sourceQuestion` is auto-derivable by stripping the last segment (FE convenience; BE stores whatever the client sends).
-
-### Concurrency locking
-- `POST /api/surveys/:id/lock` inserts/refreshes a row in `survey_locks` valid for 15 minutes.
-- `PUT /api/surveys/:id` aborts with `409` when another user owns the lock.
-- Expired locks are cleaned up lazily.
-
-### Validation engine highlights (`validation/validationEngine.js`)
-- Required survey fields: `surveyId`, `surveyName`, `surveyDescription`, `availableMediums`.
-- Required question fields: `questionId`, `surveyId`, `medium`, `questionType`, `questionDescription`.
-- `tableHeaderValue` must be exactly two comma-separated tokens for tabular question types.
-- `tableQuestionValue` is **optional**; when present it must match `^[A-Za-z]:.*(\n[A-Za-z]:.*)*$`. Literal `\n` is normalised to a real newline before testing.
-- Multiple-choice variants require ≥ 1 option (max 20, each ≤ 100 chars).
-- `_validateChildMandatory` enforces that a child question can only be `isMandatory='Yes'` when its parent is too.
-- `_validateChildMappings` blocks the same child ID being claimed by multiple options/parents.
-- The `_validateChildParentType` rule ("Only Multiple Choice Single Select questions can have child questions") was removed in favour of fewer false positives. (See [Known Constraints](#known-constraints).)
-
-### Import pipeline (`routes/import.js`)
-- A shared `parseAndValidate(req)` helper extracts both XLSX (ExcelJS) and CSV (`csv-parse`) parsing plus validation into one place. Three endpoints reuse it:
-  - `POST /api/import/preview` — returns `{ surveys, questions, validationErrors }`. Persists nothing.
-  - `POST /api/import` — same, but applies an optional `surveyIds=` filter and an `overwrite=true` switch before upserting in batches.
-  - `POST /api/import/validate-dump` — returns errors filtered to rows whose `mode` is `Correction` or `New Data`. Persists nothing.
-- **Normalisations performed during parse**:
-  - `isMandatory` → empty becomes `'No'`.
-  - `mode` → case-insensitive (`new data`, `New Data`, `NEW DATA` all collapse to `'New Data'`).
-  - `tableQuestionValue` → literal `\n` becomes a real newline.
-  - `textInputType` typos (`numaric`, etc.) collapsed to canonical values.
-- Each error includes a `cell` reference (e.g. `[Question Master B5]`) and the offending `field`.
-
-### Export pipeline
-- `GET /api/export/:surveyId` builds an XLSX with `services/excelGenerator.js` and streams it back to the client.
-
-### Question duplication subtree
-- `POST /api/surveys/:surveyId/questions/:questionId/duplicate` clones the source question **and all descendants**, remapping IDs and `OptionXChildren` references. Collisions with existing IDs return `400` listing every conflict.
-
-### Publish lifecycle
-- Stored in `surveys.publish` JSONB (`{"status": "DRAFT" | "PUBLISHED", publishedAt, publishedBy}`).
-- Gated by `FEATURE_PUBLISH=true`.
-- Question-master mutations are blocked when the survey is published.
-
----
-
-## API Documentation
-
-> All routes are mounted under `/api`. Every protected route requires `Authorization: Bearer <jwt>` unless noted.
-
-### Public
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/health` | Health check. Returns `{ status: "ok", message }`. |
-| `GET` | `/api/keep-alive` | Pings PostgreSQL (`SELECT NOW()`). Used by Vercel daily cron. |
-| `POST` | `/api/auth/login` | Body: `{ username, password }` → `{ token, user }`. |
-
-### Surveys (`/api/surveys`)
-
-| Method | Path | Auth | Notes |
-|---|---|---|---|
-| `GET` | `/` | requireAuth | List surveys (state-scoped for non-admin). |
-| `GET` | `/:id` | requireAuth | Fetch by ID (state-scoped). |
-| `POST` | `/` | requireWriteAccess | Create. Validated. State-scoped force-stamping for non-admins. |
-| `PUT` | `/:id` | requireWriteAccess | Update. Lock-aware. Forbidden when published. |
-| `DELETE` | `/:id` | requireWriteAccess | Delete + cascade-delete questions. |
-| `POST` | `/:id/duplicate` | requireWriteAccess | Duplicate the survey + (optional) its questions. |
-| `POST` | `/:id/lock` | requireWriteAccess | Acquire a 15-minute edit lock. |
-| `DELETE` | `/:id/lock` | requireWriteAccess | Release the lock if owned. |
-| `GET` | `/:id/lock` | requireAuth | Lock status. |
-| `POST` | `/:id/publish` | requireWriteAccess | Feature-flagged. |
-| `POST` | `/:id/unpublish` | requireAdmin | Admin only. |
-
-### Questions (sub-resource of surveys)
-
-| Method | Path | Auth | Notes |
-|---|---|---|---|
-| `GET` | `/api/surveys/:surveyId/questions` | requireAuth | All questions for a survey. |
-| `POST` | `/api/surveys/:surveyId/questions` | requireWriteAccess | Create. |
-| `PUT` | `/api/surveys/:surveyId/questions/:questionId` | requireWriteAccess | Update. |
-| `DELETE` | `/api/surveys/:surveyId/questions/:questionId` | requireWriteAccess | Delete. |
-| `POST` | `/api/surveys/:surveyId/questions/:questionId/duplicate` | requireWriteAccess | Subtree clone with remapped IDs. |
-
-### Admin (`/api/admin`)
-
-| Method | Path | Auth | Notes |
-|---|---|---|---|
-| `GET` | `/admin/users` | requireAdmin | List users. |
-| `POST` | `/admin/users` | requireAdmin | Create user (bcrypt hash). |
-| `PATCH` | `/admin/users/:id` | requireAdmin | Update role/state/active/password. |
-| `GET` | `/admin/state-config` | requireAdmin | List state configurations. |
-| `POST` | `/admin/state-config` | requireAdmin | Upsert. |
-| `PATCH` | `/admin/state-config/:stateCode` | requireAdmin | Update one. |
-| `DELETE` | `/admin/state-config/:stateCode` | requireAdmin | Delete. |
-
-### Import / Export (`/api/import`, `/api/export`)
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/import/preview` | Parse + validate, return `surveys`, `questions`, `validationErrors`. No persistence. |
-| `POST` | `/api/import` | Parse + validate + upsert. Query: `overwrite=true` to replace duplicates; `surveyIds=A,B,C` to import only those. |
-| `POST` | `/api/import/validate-dump` | Parse + validate. Return errors only for rows whose `Mode` is `Correction` or `New Data`. No persistence. |
-| `GET` | `/api/export/:surveyId` | Stream survey XLSX dump. |
-
-### Validation utilities
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/validate-upload` | Validate an uploaded file standalone. |
-| `GET` | `/api/validation-schema` | Return the validation schema as JSON (used by FE to render rules). |
-
-### Designations (`/api/designations`)
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/?stateCode=&activeOnly=true` | List designations. |
-| `POST` | `/` | Create (admin). |
-| `PATCH` | `/:designationId` | Update (admin). |
-| `DELETE` | `/:designationId` | Delete (admin). |
-| `POST` | `/seed-defaults` | Seed defaults. |
-| `GET` | `/export` | XLSX dump. |
-
-### Access sheet (`/api/access-sheet`)
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/dump` | Generate / refresh latest dump for a state. |
-| `GET` | `/latest?stateCode=XX` | Latest dump metadata. |
-| `GET` | `/latest/download?stateCode=XX` | Download latest dump as XLSX. |
-| `POST` | `/upload` | Upload an XLSX dump (validated). |
-
-### Translate (`/api/translate`)
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/` | Body: `{ text, source, target }`. Proxies to LibreTranslate. |
-
-### Authentication
-
-```bash
-curl -X POST http://localhost:5001/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123"}'
+-- access_sheet_latest_dump
+state_code  TEXT PRIMARY KEY
+dumped_at   TIMESTAMPTZ DEFAULT NOW()
+dumped_by   TEXT NOT NULL
+file_name   TEXT NOT NULL
+mime_type   TEXT NOT NULL DEFAULT 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+file_bytes  BYTEA NOT NULL                   -- inline XLSX blob (one per state)
+summary     JSONB NOT NULL DEFAULT '{}'
 ```
 
-Successful response:
-
-```json
-{
-  "token": "<jwt>",
-  "user": { "id": 1, "username": "admin", "role": "admin", "stateCode": null, "isActive": true }
-}
-```
-
----
-
-## Database / Data Model
-
-DDL lives in `data/db.js` and runs idempotently at startup (`CREATE TABLE IF NOT EXISTS …`). All inserts/updates go through `data/store.js`; SQL is parameterised.
-
-### Tables
-
-| Table | Primary Key | Notable columns |
-|---|---|---|
-| `surveys` | `survey_id` | `state_code`, `data` JSONB, `publish` JSONB (`{"status":"DRAFT"}` default), `created_at`, `updated_at` |
-| `questions` | `(survey_id, question_id)` | `data` JSONB, `created_at`, `updated_at`. `ON DELETE CASCADE` from `surveys`. |
-| `users` | `id` (serial) | `username` UNIQUE, `password` (bcrypt), `role` (`admin`/`state`), `state_code` nullable, `is_active` boolean. |
-| `survey_locks` | `survey_id` | `locked_by` → `users.id`, `locked_at`, `expires_at`. |
-| `designation_hierarchy` | `id` | `state_code`, `designation_id`, `hierarchy_level`, `designation_name`, `medium`, `medium_in_english`, `is_active`, `created_by`, `updated_by`. UNIQUE `(state_code, medium_in_english, hierarchy_level)`. |
-| `state_config` | `state_code` | `state_name`, `available_languages` (CSV string). |
-| `access_sheet_latest_dump` | `state_code` | `dumped_at`, `dumped_by`, `file_name`, `mime_type`, `file_bytes` BYTEA, `summary` JSONB. |
-
-### Indexes
+### 4.2 Indexes
 
 ```
 idx_surveys_state_code   ON surveys(state_code)
@@ -346,289 +175,247 @@ idx_designation_state    ON designation_hierarchy(state_code)
 idx_users_username       ON users(username)
 ```
 
-### Inline migrations
+### 4.3 Inline migrations (run every boot)
 
-`initDB()` runs a few defensive `ALTER` statements on every boot so older databases don't break:
-- `designation_hierarchy.designation_id` is allowed to be NULL.
-- The legacy `(state_code, designation_id)` UNIQUE constraint is dropped if present.
-- New columns (`state_code`, `publish`, `created_at`, `updated_at`) are added to `surveys` if missing.
+- `designation_hierarchy.designation_id` made NULLable.
+- Old constraint `designation_hierarchy_state_code_designation_id_key` dropped if present.
+- New columns added to existing `surveys`: `state_code`, `publish`, `created_at`, `updated_at`.
 
-### Admin seed
+### 4.4 Admin seed
 
-If `SEED_ADMIN_USER` and `SEED_ADMIN_PASSWORD` are both present and the user does not already exist, `initDB()` inserts an admin with bcrypt-hashed credentials.
+On boot, if `SEED_ADMIN_USER` and `SEED_ADMIN_PASSWORD` are set AND the user doesn't exist, a bcrypt-hashed admin is inserted.
 
----
+### 4.5 `surveys.data` / `questions.data` JSONB shape
 
-## Environment Variables
-
-> **Note:** there is no `.env.example` file in the repository (despite older docs referencing one). Create `.env` manually using the table below. Never commit it.
-
-| Variable | Required | Default | Where used | Purpose |
-|---|---|---|---|---|
-| `DATABASE_URL` | Yes | `postgresql://postgres:postgres@localhost:5432/fmb_survey_builder` | `data/db.js` | PostgreSQL connection string. |
-| `JWT_SECRET` | Yes (prod) | `dev-secret-change-in-production` *(Inferred)* | `routes/auth.js`, `middleware/auth.js` | HMAC key for JWT signing/verification. |
-| `PORT` | No | `5001` | `app.js` | HTTP port for `npm start`. |
-| `SEED_ADMIN_USER` | No | — | `data/db.js` | Username for first-boot admin seed. |
-| `SEED_ADMIN_PASSWORD` | No | — | `data/db.js` | Password for first-boot admin seed. |
-| `FEATURE_PUBLISH` | No | `false` | `routes/surveys.js` | Enables publish/unpublish endpoints when `true`. |
-| `NODE_ENV` | No | `development` | `data/db.js` | `production` forces SSL on PostgreSQL. |
-| `DB_SSL` | No | auto | `data/db.js` | Force-enable SSL (`true` / `false`). |
-| `TRANSLATE_API_URL` | No | `https://libretranslate.de/translate` | `routes/translate.js` | Upstream translation backend. |
-| `TRANSLATE_API_KEY` | No | — | `routes/translate.js` | Optional API key. |
-| `TRANSLATE_TIMEOUT_MS` | No | `10000` | `routes/translate.js` | Timeout (ms). |
-| `IMPORT_MAX_FILE_SIZE_MB` | No | `10` | `routes/import.js` | Multer upload cap. |
-| `IMPORT_MAX_ROWS` | No | `10000` | `routes/import.js` | Hard row cap per file. |
-| `IMPORT_UPSERT_BATCH_SIZE` | No | `25` | `routes/import.js` | Concurrency for `Promise.all` upserts. |
-| `VERCEL` | No | (auto) | `app.js`, `data/db.js` | Detected at runtime to switch into serverless mode. |
+See the **root README §4** for the JSONB shape contract — single source of truth.
 
 ---
 
-## Installation & Local Setup
+## 5. API Reference
 
-### Prerequisites
-- Node.js 18+ (16 minimum)
-- npm 8+
-- PostgreSQL 13+ (local or cloud)
+> All paths under `/api`. Protected routes require `Authorization: Bearer <jwt>`.
 
-### Setup
+### Public
 
-```bash
-cd Survey-builder-BE
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | `{ status: "ok" }` |
+| `GET` | `/keep-alive` | `SELECT NOW()` ping — cron target |
+| `POST` | `/auth/login` | `{username, password}` → `{token, user}` |
 
-# 1. Create .env (no .env.example shipped). Suggested minimum:
-cat > .env <<'ENV'
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/fmb_survey_builder
-JWT_SECRET=replace-with-a-long-random-string
-PORT=5001
-SEED_ADMIN_USER=admin
-SEED_ADMIN_PASSWORD=admin123
-FEATURE_PUBLISH=false
-NODE_ENV=development
-ENV
+### Surveys & Questions (`requireAuth` + write gates)
 
-# 2. Install
-npm install
+| Method | Path | Auth gate |
+|---|---|---|
+| `GET` | `/surveys` | requireAuth (state-scoped) |
+| `GET` | `/surveys/:id` | requireAuth (state-scoped) |
+| `POST` | `/surveys` | requireWriteAccess |
+| `PUT` | `/surveys/:id` | requireWriteAccess + lock check |
+| `DELETE` | `/surveys/:id` | requireWriteAccess |
+| `POST` | `/surveys/:id/duplicate` | requireWriteAccess |
+| `POST` | `/surveys/:id/lock` | requireWriteAccess |
+| `GET` | `/surveys/:id/lock` | requireAuth |
+| `DELETE` | `/surveys/:id/lock` | requireAuth (only owner) |
+| `POST` | `/surveys/:id/publish` | requireWriteAccess + `FEATURE_PUBLISH` |
+| `POST` | `/surveys/:id/unpublish` | **requireAdmin** |
+| `GET` | `/surveys/:id/questions` | requireAuth |
+| `POST` | `/surveys/:id/questions` | requireWriteAccess |
+| `PUT` | `/surveys/:id/questions/:qId` | requireWriteAccess |
+| `DELETE` | `/surveys/:id/questions/:qId` | requireWriteAccess |
+| `POST` | `/surveys/:sId/questions/:qId/duplicate` | requireWriteAccess (subtree clone) |
 
-# 3. Run
-npm run dev    # nodemon (auto-restart)
-# or
-npm start      # plain node app.js
-```
+### Admin (`requireAdmin`)
 
-The first request after start triggers `initDB()` which creates all tables and seeds the admin user.
+| Method | Path |
+|---|---|
+| `GET` / `POST` / `PATCH` | `/admin/users`, `/admin/users/:id` |
+| `GET` / `POST` / `PATCH` / `DELETE` | `/admin/state-config`, `/admin/state-config/:state_code` |
 
-### Verify
+### Import / Export
 
-```bash
-curl http://localhost:5001/api/health
-# {"status":"ok","message":"FMB Survey Builder API is running"}
-```
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/import/preview` | Validate, return parsed data. No persistence. |
+| `POST` | `/import?overwrite=…&surveyIds=…` | Validate + upsert. |
+| `POST` | `/import/validate-dump` | Errors only for `Mode∈{New Data,Correction}`. No persistence. |
+| `GET` | `/export/:surveyId` | XLSX stream. |
 
----
+### Designations
 
-## Running the Project
+| Method | Path |
+|---|---|
+| `GET` | `/designations?stateCode=&activeOnly=true` |
+| `GET` | `/designations/export` |
+| `POST` | `/designations/seed-defaults` |
+| `POST` | `/designations` (write) |
+| `PATCH` | `/designations/:id` (write) |
+| `DELETE` | `/designations/:id` (write) |
 
-### Scripts (`package.json`)
+### Access Sheet
 
-```bash
-npm start      # node app.js
-npm run dev    # nodemon app.js
-```
+| Method | Path |
+|---|---|
+| `POST` | `/access-sheet/dump` |
+| `GET` | `/access-sheet/latest?stateCode=XX` |
+| `GET` | `/access-sheet/latest/download?stateCode=XX` |
+| `POST` | `/access-sheet/validate` |
 
-There is no separate test, lint, build, or migration script. DDL runs at boot. Uploads land in `uploads/` (created at runtime, gitignored).
+### Utility
 
-### Useful one-liners
+| Method | Path |
+|---|---|
+| `POST` | `/translate` (LibreTranslate proxy) |
+| `POST` | `/validate-upload` |
+| `GET` | `/validation-schema` |
 
-```bash
-# Sanity-check syntax of a route file (no test framework configured)
-node -c routes/surveys.js
-
-# Manual ad-hoc DB query
-psql "$DATABASE_URL" -c 'select count(*) from surveys'
-```
-
----
-
-## Testing
-
-No tests are committed. The project is a clean slate for adding **Jest + Supertest** for HTTP integration tests:
-
-- Add `"test": "jest"` to `package.json`.
-- Place tests in `tests/` or alongside source files (`routes/surveys.test.js`).
-- Use a separate database via `TEST_DATABASE_URL` to avoid polluting development data.
-
----
-
-## Deployment
-
-### Vercel serverless (default in this repo)
-
-`vercel.json`:
+### Error envelope (validation)
 
 ```json
 {
-  "version": 2,
-  "rewrites": [{ "source": "/(.*)", "destination": "/app.js" }],
-  "crons": [
-    { "path": "/api/keep-alive", "schedule": "0 8 * * *" }
+  "error": "Validation failed",
+  "validationErrors": [
+    {
+      "type": "question",
+      "row": 5,
+      "sheet": "Question Master",
+      "surveyId": "MY_SURVEY",
+      "questionId": "Q3.1",
+      "errors": [
+        { "field": "isMandatory", "message": "[Question Master B5] …",
+          "value": "Yes", "row": 5, "column": "B", "cell": "B5" }
+      ]
+    }
   ]
 }
 ```
 
-- Every request is routed to `app.js`.
-- A daily cron runs `/api/keep-alive` at 08:00 UTC, executing `SELECT NOW()` to prevent free-tier database providers (Supabase) from auto-pausing.
-- `app.js` only invokes `app.listen()` when `process.env.VERCEL` is unset.
+---
 
-### Long-lived Node host (Render / EC2 / Fly.io)
+## 6. Validation Engine — Key Rules
 
-- Run `npm start`.
-- Provide every required env var.
-- Bind a public hostname; the existing FE rewrite expects `https://survey-builder-be.onrender.com` — adjust on either side.
+(Full source: [`validation/validationEngine.js`](./validation/validationEngine.js))
+
+- **Required survey fields:** `surveyId`, `surveyName`, `surveyDescription`, `availableMediums`.
+- **Required question fields:** `questionId`, `surveyId`, `medium`, `questionType`, `questionDescription`.
+- **Question ID:** `^Q\d+(\.\d+)*$`.
+- **MCSS options:** 1–20, each ≤ 100 chars.
+- **Tabular `tableHeaderValue`:** exactly two comma-separated headers.
+- **Tabular `tableQuestionValue`:** optional; if present, `^[A-Za-z]:.*(\n[A-Za-z]:.*)*$` (literal `\n` normalised before testing).
+- **Child mandatory:** child can be `isMandatory='Yes'` only if its parent is too (`_validateChildMandatory`).
+- **Child mappings:** a child ID may be claimed by exactly one option/parent (`_validateChildMappings`).
+- **Removed:** `_validateChildParentType` (false positives from whitespace/casing in `questionType`).
+
+### Import-time normalisations
+
+- `isMandatory` empty → `'No'`.
+- `mode` case-insensitive collapse (`new data`/`NEW DATA` → `'New Data'`).
+- `tableQuestionValue`: literal `\n` → real newline.
+- `textInputType`: common typos (`numaric`) → canonical.
+
+---
+
+## 7. Environment Variables
+
+See **root README §5** for the full table. Required: `DATABASE_URL`, `JWT_SECRET`. Optional but useful: `SEED_ADMIN_USER`/`SEED_ADMIN_PASSWORD`, `FEATURE_PUBLISH`, `IMPORT_MAX_*`, `TRANSLATE_*`.
+
+No `.env.example` ships — create manually.
+
+---
+
+## 8. Local Setup
+
+```bash
+cd Survey-builder-BE
+# Create .env (no template shipped). Minimum:
+#   DATABASE_URL=postgresql://postgres:postgres@localhost:5432/fmb_survey_builder
+#   JWT_SECRET=replace-with-a-long-random-string
+#   SEED_ADMIN_USER=admin
+#   SEED_ADMIN_PASSWORD=admin123
+npm install
+npm run dev        # nodemon
+# Sanity:
+curl http://localhost:5001/api/health
+```
+
+First request triggers `initDB()` → tables + admin seed. No separate migration step.
+
+---
+
+## 9. Deployment
+
+### Vercel serverless (default)
+
+```json
+{ "version": 2,
+  "rewrites": [{ "source": "/(.*)", "destination": "/app.js" }],
+  "crons":    [{ "path": "/api/keep-alive", "schedule": "0 8 * * *" }] }
+```
+
+- Every request → `app.js`.
+- `app.listen` is **skipped** when `process.env.VERCEL` is set.
+- Pool downgrades to `max=2`, idle `10 s` in serverless mode (see [`data/db.js:13-20`](./data/db.js#L13-L20)).
+
+### Long-lived Node (Render/EC2/Fly)
+
+- `npm start` runs `node app.js`.
+- Set all required env vars.
+- Existing FE rewrite points at `https://survey-builder-be.onrender.com` — match or change.
 
 ### CORS
 
-`app.use(cors())` is currently fully open. **Restrict it before serious production use.**
+`app.use(cors())` is fully open today. **Lock down before serious production.**
 
 ---
 
-## Security & Permissions
+## 10. Limits & Known Constraints
 
-### Authentication
-- JWT issued by `POST /api/auth/login`. The token expires after 24 hours.
-- `middleware/auth.js` verifies the token and decodes `req.user`.
-
-### Authorization
-
-| Middleware | Checks |
-|---|---|
-| `requireAuth` | Token present + valid. |
-| `requireAdmin` | `req.user.role === 'admin'`. |
-| `requireWriteAccess` | admin **or** (state user **and** `is_active=true`). |
-
-### Role matrix
-
-| Action | admin | state (active) | state (inactive) |
-|---|---|---|---|
-| Read own-state surveys | ✓ | ✓ | ✓ |
-| Read all surveys | ✓ | — | — |
-| Create / update / delete survey | ✓ | ✓ | — |
-| Publish survey | ✓ | ✓ | — |
-| Unpublish survey | ✓ | — | — |
-| User management | ✓ | — | — |
-| State config | ✓ | — | — |
-
-### Other security practices
-
-- All SQL is parameterised (`$1`, `$2`, …) — never string-interpolated.
-- Multer caps uploads at `IMPORT_MAX_FILE_SIZE_MB` (default 10 MB).
-- Upload rows are capped at `IMPORT_MAX_ROWS` (default 10,000) to avoid runaway memory use.
+- **No tests.** No framework configured.
+- **No structured logging or APM** — `console.*` only.
+- **CORS open** (no allow-list).
+- **No rate limiting.** `/auth/login` and `/import` are exposed.
+- **No `.env.example`.**
+- **No migration tool** — DDL on boot; rollbacks are manual.
+- **Excel export buffers** the whole workbook (no `exceljs` streaming write).
+- **`access_sheet_latest_dump.file_bytes`** stores BYTEA — large files inflate row size; move to object storage at scale.
+- **Vercel function timeout** can be exceeded by very large XLSX imports. FE bumps Axios upload timeout to 5 minutes; platform limit still applies.
+- **`csv-parse` / `multer`** pinned to older majors.
+- **JWT in `localStorage` (FE)** — XSS-readable. No refresh tokens, no httpOnly cookie path.
+- **`questionType=Voice Response`** is in the enum but no FE renderer (Inferred).
 
 ---
 
-## Error Handling & Logging
+## 11. Future Improvements
 
-- Global Express error middleware in `app.js` returns:
-  ```json
-  { "error": "<type>", "message": "<message>", "errors": ["…"] }
-  ```
-- Routes wrap the handler body in `try/catch` and `console.error` failures.
-- Validation responses look like:
-  ```json
-  {
-    "error": "Validation failed",
-    "validationErrors": [
-      {
-        "type": "question",
-        "row": 5,
-        "sheet": "Question Master",
-        "surveyId": "MY_SURVEY",
-        "questionId": "Q3.1",
-        "errors": [
-          { "field": "isMandatory", "message": "[Question Master B5] …", "value": "Yes", "row": 5, "column": "B", "cell": "B5" }
-        ]
-      }
-    ]
-  }
-  ```
-- Logging is `console.log` / `console.error` only — no structured logger today.
+- Migrate DDL to `node-pg-migrate` / `knex` / Prisma.
+- Add Jest + Supertest integration tests; use `TEST_DATABASE_URL`.
+- Tighten CORS to an allow-list (`CORS_ORIGINS` env).
+- Replace `console.*` with `pino` (structured JSON logs).
+- Add `express-rate-limit` on `/auth/login` and `/import/*`.
+- Stream XLSX export instead of buffering.
+- Move access-sheet blobs to S3 / Supabase Storage.
+- Issue refresh tokens; move JWT to `httpOnly` cookies.
+- Split `data/store.js` into per-table repositories.
+- Add audit-log table (see `../AUDIT_LOGGING.md`).
 
 ---
 
-## Known Constraints
+## 12. Conventions
 
-- **No `.env.example`** is committed — populate `.env` manually.
-- **No tests** at all.
-- **CORS is wide open** in production.
-- **`csv-parse` and `multer`** are pinned to older majors that may need bumping.
-- **No structured logging or APM** (`console.*` only).
-- **DDL on boot** instead of a migration tool — fine for a small schema, but rollbacks are manual.
-- **The historical `_validateChildParentType` rule was removed** because of false positives caused by whitespace/casing differences in `questionType` cells. If you re-introduce a similar check, normalise `questionType` first.
-- **Long-running uploads on Vercel serverless** can exceed function execution limits for very large XLSX files. The frontend bumps its Axios timeout to 5 minutes; the platform's own limit still applies.
-- **`access_sheet_latest_dump.file_bytes`** stores files as `BYTEA` — large files inflate row size. Consider object storage if files commonly exceed a few MB.
+- **Layering:** `route → middleware → service/validator → store → pg`. Never embed SQL in routes.
+- **SQL safety:** parameterised only (`$1, $2 …`).
+- **Naming:** camelCase JS, SCREAMING_SNAKE constants, snake_case DB columns.
+- **Async/error:** all handlers `async` + `try/catch`; rethrow to global Express handler when appropriate.
+- **No comments by default** — code should self-document. Comment only the *why* of non-obvious logic.
 
 ---
 
-## Future Improvements
-
-- Replace inline DDL in `data/db.js` with a real migration tool (`node-pg-migrate`, `knex`, Prisma).
-- Add **Jest + Supertest** integration tests.
-- Move SQL helpers in `data/store.js` toward a small repository pattern (one module per table) as the codebase grows.
-- Tighten CORS to a configurable allow-list.
-- Replace `console.*` with a structured logger (`pino` or `winston`).
-- Add request rate limiting on `/api/auth/login` and `/api/import*`.
-- Stream XLSX export instead of buffering the entire workbook in memory.
-- Move large `access_sheet_latest_dump` file blobs to object storage (S3, Supabase storage).
-- Issue refresh tokens / move JWT into `httpOnly` cookies to remove `localStorage` exposure on the FE.
-
----
-
-## Contribution Guidelines
-
-> No `CONTRIBUTING.md` is committed; this section is inferred from project conventions.
-
-### Branching
-- Features: `feature/<short-description>`
-- Fixes: `fix/<short-description>`
-
-### Commits
-- Imperative present tense (`Add /api/import/validate-dump`).
-- Avoid amending commits that have already been pushed.
-
-### When adding a new route
-
-1. Create `routes/myFeature.js` exporting an Express `Router`.
-2. Apply `requireAuth` (and `requireAdmin` / `requireWriteAccess` as appropriate).
-3. Add SQL helpers to `data/store.js`. **Never embed SQL in route files.**
-4. Mount in `app.js`:
-   ```js
-   const myFeatureRouter = require('./routes/myFeature');
-   app.use('/api/my-feature', requireAuth, myFeatureRouter);
-   ```
-5. If the feature needs validation, extend `validation/validationEngine.js` and `schemas/validationRules.js`.
-6. Update this README's [API Documentation](#api-documentation) table.
-
-### Code style
-
-- camelCase variables/functions; SCREAMING_SNAKE_CASE constants.
-- snake_case database columns.
-- Prefer no comments — code should be self-documenting. Comment only when the *why* is non-obvious.
-- Keep route handlers thin: parse → validate → call store → respond.
-
----
-
-## Quick Reference
+## 13. Quick Reference
 
 ```bash
-# Dev
-npm run dev
-
-# Prod
-npm start
-
-# Health
+npm run dev                              # nodemon dev server
+npm start                                # node app.js
 curl http://localhost:5001/api/health
 curl http://localhost:5001/api/keep-alive
-
-# DB sanity check
-psql "$DATABASE_URL" -c '\dt'
+node -c routes/surveys.js                # syntax check (no tests configured)
+psql "$DATABASE_URL" -c '\dt'            # list tables
 ```
