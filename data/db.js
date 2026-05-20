@@ -153,6 +153,20 @@ async function initDB() {
       )
     `);
 
+    // Defensive: if audit_logs predates this code with a different schema,
+    // backfill missing columns instead of crashing on the index creates below.
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS actor_id    INT`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS actor_label TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS actor_role  TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS state_code  TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS action      TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS entity_type TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS entity_id   TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS metadata    JSONB NOT NULL DEFAULT '{}'`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS ip          TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS user_agent  TEXT`).catch(() => {});
+    await client.query(`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()`).catch(() => {});
+
     // Dual-auth: additive columns on users. Legacy username/password kept nullable.
     await client.query(`ALTER TABLE users ALTER COLUMN username DROP NOT NULL`).catch(() => {});
     await client.query(`ALTER TABLE users ALTER COLUMN password DROP NOT NULL`).catch(() => {});
