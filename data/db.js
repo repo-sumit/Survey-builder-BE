@@ -222,12 +222,12 @@ async function initDB() {
     }
     end LEGACY LOGIN */
 
-    // Seed admin invite if email env vars are set (Google Sign-In path)
+    // Seed admin invite (idempotent) — every boot ensures the seed email is admin+active.
     const seedEmail = process.env.SEED_ADMIN_EMAIL;
     const seedName = process.env.SEED_ADMIN_NAME;
     if (seedEmail) {
       const existing = await pool.query(
-        'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
+        'SELECT id, role, is_active FROM users WHERE LOWER(email) = LOWER($1)',
         [seedEmail]
       );
       if (existing.rows.length === 0) {
@@ -236,7 +236,22 @@ async function initDB() {
            VALUES ($1, $2, 'admin', NULL, TRUE, NOW())`,
           [seedEmail, seedName || null]
         );
-        console.log(`Seeded admin invite: ${seedEmail}`);
+        console.log(`Seeded admin: ${seedEmail}`);
+      } else {
+        const row = existing.rows[0];
+        if (row.role !== 'admin' || row.is_active !== true) {
+          await pool.query(
+            `UPDATE users
+                SET role       = 'admin',
+                    state_code = NULL,
+                    is_active  = TRUE,
+                    name       = COALESCE(name, $2),
+                    updated_at = NOW()
+              WHERE LOWER(email) = LOWER($1)`,
+            [seedEmail, seedName || null]
+          );
+          console.log(`Promoted seed admin to admin/active: ${seedEmail}`);
+        }
       }
     }
 
