@@ -45,11 +45,13 @@ async function trySupabaseJwt(token) {
   if (!isSupabaseConfigured()) return { ok: false };
   let claims;
   try {
-    claims = verifySupabaseToken(token);
-  } catch {
+    claims = await verifySupabaseToken(token);
+  } catch (err) {
+    // Verification failed (wrong signature, expired, unsupported alg, etc.)
+    // — fall through to the legacy path.
     return { ok: false };
   }
-  if (!claims.email) {
+  if (!claims || !claims.email) {
     return { ok: false, reason: 'NO_EMAIL_IN_TOKEN' };
   }
   if (!emailDomainAllowed(claims.email)) {
