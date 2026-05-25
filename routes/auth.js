@@ -1,17 +1,27 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { pool } = require('../data/db');
-const { JWT_SECRET, requireAuth } = require('../middleware/auth');
-const { logAudit } = require('../services/audit');
+// LEGACY LOGIN — disabled. Kept commented for reference.
+// const bcrypt = require('bcryptjs');
+// const jwt = require('jsonwebtoken');
+// const { pool } = require('../data/db');
+// const { JWT_SECRET } = require('../middleware/auth');
+// const { logAudit } = require('../services/audit');
+const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
+// POST /api/auth/login — DISABLED. Use Google Sign-In via Supabase instead.
+router.post('/login', (req, res) => {
+  return res.status(410).json({
+    error: 'Legacy login disabled',
+    message: 'Username/password login has been removed. Sign in with Google.'
+  });
+});
+
+/* LEGACY LOGIN — full implementation preserved here, commented out.
 function legacyLoginEnabled() {
   return (process.env.LEGACY_LOGIN_ENABLED || 'true').toLowerCase() !== 'false';
 }
 
-// POST /api/auth/login  (legacy username/password — gated by LEGACY_LOGIN_ENABLED)
 router.post('/login', async (req, res) => {
   if (!legacyLoginEnabled()) {
     return res.status(410).json({
@@ -37,7 +47,6 @@ router.post('/login', async (req, res) => {
 
     const user = result.rows[0];
     if (!user.password) {
-      // User exists but has no password (invite-only Google account).
       return res.status(401).json({ error: 'Invalid username or password' });
     }
     const validPassword = await bcrypt.compare(password, user.password);
@@ -56,7 +65,6 @@ router.post('/login', async (req, res) => {
 
     const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '24h' });
 
-    // Fire-and-forget audit (best-effort: req.user isn't set on the public route)
     logAudit({ user: { id: user.id, label: user.email || user.username, role: user.role, stateCode: user.state_code }, headers: req.headers, socket: req.socket }, {
       action: 'auth.login.legacy',
       entityType: 'user',
@@ -80,9 +88,9 @@ router.post('/login', async (req, res) => {
     res.status(500).json({ error: 'Login failed', message: err.message });
   }
 });
+end LEGACY LOGIN */
 
 // GET /api/auth/me — returns the local profile for the bearer token.
-// Works for both auth paths (Supabase JWT and legacy JWT).
 router.get('/me', requireAuth, (req, res) => {
   res.json({ user: req.user });
 });

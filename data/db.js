@@ -206,7 +206,7 @@ async function initDB() {
 
     await client.query('COMMIT');
 
-    // Seed admin user if env vars are set (legacy username/password path)
+    /* LEGACY LOGIN — username/password admin seed disabled. Kept for reference.
     const seedUser = process.env.SEED_ADMIN_USER;
     const seedPass = process.env.SEED_ADMIN_PASSWORD;
     if (seedUser && seedPass) {
@@ -220,6 +220,7 @@ async function initDB() {
         console.log(`Seeded admin user: ${seedUser}`);
       }
     }
+    end LEGACY LOGIN */
 
     // Seed admin invite if email env vars are set (Google Sign-In path)
     const seedEmail = process.env.SEED_ADMIN_EMAIL;

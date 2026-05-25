@@ -1,5 +1,6 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
+// LEGACY LOGIN — disabled. bcryptjs no longer needed at runtime.
+// const bcrypt = require('bcryptjs');
 const { pool } = require('../data/db');
 const { requireWriteAccess } = require('../middleware/auth');
 const {
@@ -41,13 +42,11 @@ router.get('/users', async (req, res) => {
   }
 });
 
-// POST /api/admin/users
-// Two shapes accepted (dual-auth window):
-//   1) Invite by email (preferred):  { email, name, role, stateCode }
-//   2) Legacy create:                { username, password, role, stateCode }
+// POST /api/admin/users — invite by email (Google sign-in).
+// LEGACY LOGIN — username/password create path disabled. See commented block below.
 router.post('/users', requireWriteAccess, async (req, res) => {
   try {
-    const { email, name, username, password, role, stateCode } = req.body;
+    const { email, name, role, stateCode } = req.body;
 
     if (!['admin', 'state'].includes(role)) {
       return res.status(400).json({ error: 'Role must be "admin" or "state"' });
@@ -56,65 +55,47 @@ router.post('/users', requireWriteAccess, async (req, res) => {
       return res.status(400).json({ error: 'State code is required for state users' });
     }
 
-    // Invite path
-    if (email) {
-      if (!EMAIL_RE.test(email)) {
-        return res.status(400).json({ error: 'Invalid email address' });
-      }
-      const existing = await findUserByEmail(email);
-      if (existing) {
-        return res.status(409).json({ error: 'A user with that email already exists' });
-      }
-      const profile = await insertUserInvite({
-        email: email.toLowerCase(),
-        name,
-        role,
-        stateCode: role === 'admin' ? null : stateCode
-      });
-      logAudit(req, {
-        action: 'user.invite',
-        entityType: 'user',
-        entityId: String(profile.id),
-        metadata: { email: profile.email, role: profile.role, stateCode: profile.stateCode }
-      });
-      return res.status(201).json(profile);
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
     }
-
-    // Legacy create path (kept for dual-auth window)
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Provide email + name (invite) or username + password (legacy)' });
+    if (!EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: 'Invalid email address' });
     }
-    const existingLegacy = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
-    if (existingLegacy.rows.length > 0) {
-      return res.status(400).json({ error: 'Username already exists' });
+    const existing = await findUserByEmail(email);
+    if (existing) {
+      return res.status(409).json({ error: 'A user with that email already exists' });
     }
-    const hash = await bcrypt.hash(password, 10);
-    const result = await pool.query(
-      `INSERT INTO users (username, password, role, state_code, is_active)
-       VALUES ($1, $2, $3, $4, TRUE)
-       RETURNING id, username, role, state_code, is_active, created_at`,
-      [username, hash, role, role === 'admin' ? null : stateCode]
-    );
-    const user = result.rows[0];
+    const profile = await insertUserInvite({
+      email: email.toLowerCase(),
+      name,
+      role,
+      stateCode: role === 'admin' ? null : stateCode
+    });
     logAudit(req, {
-      action: 'user.create.legacy',
+      action: 'user.invite',
       entityType: 'user',
-      entityId: String(user.id),
-      metadata: { username: user.username, role: user.role, stateCode: user.state_code }
+      entityId: String(profile.id),
+      metadata: { email: profile.email, role: profile.role, stateCode: profile.stateCode }
     });
-    res.status(201).json({
-      id: user.id,
-      username: user.username,
-      role: user.role,
-      stateCode: user.state_code,
-      isActive: user.is_active,
-      createdAt: user.created_at
-    });
+    return res.status(201).json(profile);
   } catch (err) {
     console.error('Create user error:', err);
     res.status(500).json({ error: 'Failed to create user', message: err.message });
   }
 });
+
+/* LEGACY LOGIN — username/password create path disabled. Kept for reference.
+// Pre-disabled body also handled this shape:
+//   { username, password, role, stateCode }
+// const existingLegacy = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+// if (existingLegacy.rows.length > 0) return res.status(400).json({ error: 'Username already exists' });
+// const hash = await bcrypt.hash(password, 10);
+// const result = await pool.query(
+//   `INSERT INTO users (username, password, role, state_code, is_active)
+//    VALUES ($1, $2, $3, $4, TRUE) RETURNING ...`,
+//   [username, hash, role, role === 'admin' ? null : stateCode]
+// );
+end LEGACY LOGIN */
 
 // PATCH /api/admin/users/:id
 // Accepts: { name, role, stateCode, isActive, password }
@@ -145,14 +126,20 @@ router.patch('/users/:id', requireWriteAccess, async (req, res) => {
       updated = await updateUserProfile(userId, profileUpdates);
     }
 
-    // Optional legacy password reset (only meaningful while username is set)
+    // LEGACY LOGIN — password reset disabled. Kept for reference.
     if (password !== undefined) {
-      if (!existing.username) {
-        return res.status(400).json({ error: 'Cannot set password on an invite-only user' });
-      }
-      const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [hash, userId]);
+      return res.status(410).json({ error: 'Password reset disabled. Legacy login is no longer supported.' });
     }
+    /*
+    // Optional legacy password reset (only meaningful while username is set)
+    // if (password !== undefined) {
+    //   if (!existing.username) {
+    //     return res.status(400).json({ error: 'Cannot set password on an invite-only user' });
+    //   }
+    //   const hash = await bcrypt.hash(password, 10);
+    //   await pool.query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [hash, userId]);
+    // }
+    end LEGACY LOGIN */
 
     logAudit(req, {
       action: 'user.update',

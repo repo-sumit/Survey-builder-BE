@@ -1,7 +1,9 @@
-const jwt = require('jsonwebtoken');
+// LEGACY LOGIN — legacy JWT fallback is disabled. Only Supabase auth is honored.
+// const jwt = require('jsonwebtoken');
 const {
+  // findUserByEmail and findUserById are still used by Supabase path
   findUserByEmail,
-  findUserById,
+  // findUserById,   // only used by legacy path — disabled
   touchUserLastLogin
 } = require('../data/store');
 const {
@@ -10,6 +12,7 @@ const {
   emailDomainAllowed
 } = require('../services/supabaseAuth');
 
+// LEGACY LOGIN — kept for reference; not used while legacy login is disabled.
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 
 function fail(res, status, error, message) {
@@ -30,6 +33,7 @@ function buildReqUser(profile) {
   };
 }
 
+/* LEGACY LOGIN — disabled. Kept commented for reference.
 async function tryLegacyJwt(token) {
   let payload;
   try {
@@ -40,6 +44,7 @@ async function tryLegacyJwt(token) {
   if (!payload || !payload.id) return null;
   return await findUserById(payload.id);
 }
+end LEGACY LOGIN */
 
 async function trySupabaseJwt(token) {
   if (!isSupabaseConfigured()) return { ok: false };
@@ -48,7 +53,6 @@ async function trySupabaseJwt(token) {
     claims = await verifySupabaseToken(token);
   } catch (err) {
     // Verification failed (wrong signature, expired, unsupported alg, etc.)
-    // — fall through to the legacy path.
     return { ok: false };
   }
   if (!claims || !claims.email) {
@@ -78,7 +82,7 @@ async function requireAuth(req, res, next) {
   }
   const token = header.slice(7);
 
-  // 1. Supabase path
+  // 1. Supabase path (only auth path now)
   const supa = await trySupabaseJwt(token);
   if (supa.ok) {
     if (supa.reject) {
@@ -88,15 +92,13 @@ async function requireAuth(req, res, next) {
     return next();
   }
 
-  // 2. Legacy path
+  /* LEGACY LOGIN — fallback path disabled. Kept commented for reference.
   const legacyProfile = await tryLegacyJwt(token);
   if (legacyProfile) {
-    if (!legacyProfile.isActive && legacyProfile.role !== 'admin') {
-      // Inactive non-admin: allow read paths to flow; requireWriteAccess will block writes.
-    }
     req.user = buildReqUser(legacyProfile);
     return next();
   }
+  end LEGACY LOGIN */
 
   return fail(res, 401, 'Invalid or expired token');
 }
