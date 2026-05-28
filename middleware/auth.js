@@ -15,6 +15,41 @@ const {
 // LEGACY LOGIN — kept for reference; not used while legacy login is disabled.
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 
+/**
+ * In-memory throttle for `touchUserLastLogin`.
+ *
+ * Before this throttle the auth middleware fired an UPDATE on every
+ * authenticated request (the FE refreshes /me on boot, on TOKEN_REFRESHED,
+ * and on retry — easily 10+ times in a normal session). On cold Render
+ * dynos this UPDATE shares a slow connection pool with the user lookup
+ * and contributes measurable latency to /api/auth/me.
+ *
+ * `last_login_at` is an audit hint — a stale value by up to 10 min is
+ * acceptable. RBAC does not consult this column. Throttling here:
+ *   - Skips the DB write when we've already written for this userId in
+ *     the last LAST_LOGIN_THROTTLE_MS window.
+ *   - Still runs the underlying call as fire-and-forget when not stale,
+ *     so request latency is unaffected either way.
+ *   - Lives entirely in process memory — bounded by user count.
+ *     Stateless restarts (the common case on Render) flush the map, so
+ *     the first /me after a restart always writes through. Acceptable.
+ */
+const LAST_LOGIN_THROTTLE_MS = 10 * 60 * 1000;
+const lastLoginTouchedAt = new Map(); // userId → epoch ms of last write
+
+function _shouldTouchLastLogin(userId, now = Date.now()) {
+  const prev = lastLoginTouchedAt.get(userId);
+  if (!prev || (now - prev) >= LAST_LOGIN_THROTTLE_MS) {
+    lastLoginTouchedAt.set(userId, now);
+    return true;
+  }
+  return false;
+}
+// Exposed for tests only. Not part of the public middleware contract.
+function _resetLastLoginThrottleForTests() {
+  lastLoginTouchedAt.clear();
+}
+
 function fail(res, status, error, message) {
   return res.status(status).json({ error, message: message || error });
 }
@@ -69,9 +104,15 @@ async function trySupabaseJwt(token) {
     return { ok: true, reject: { status: 403, error: 'INACTIVE', message: 'Account is inactive.' } };
   }
   // Best-effort: update last_login_at and link supabase_user_id.
-  touchUserLastLogin(profile.id, claims.sub).catch(err => {
-    console.error('touchUserLastLogin failed', err.message);
-  });
+  // Throttled to once per LAST_LOGIN_THROTTLE_MS per user so a chatty
+  // /me caller (boot + TOKEN_REFRESHED + retry + tab focus, all within
+  // seconds) doesn't fire 5+ UPDATEs against the same row. RBAC does
+  // not depend on last_login_at; a 10-minute staleness is fine.
+  if (_shouldTouchLastLogin(profile.id)) {
+    touchUserLastLogin(profile.id, claims.sub).catch(err => {
+      console.error('touchUserLastLogin failed', err.message);
+    });
+  }
   return { ok: true, profile };
 }
 
@@ -123,4 +164,14 @@ function requireWriteAccess(req, res, next) {
   next();
 }
 
-module.exports = { requireAuth, requireAdmin, requireWriteAccess, JWT_SECRET };
+module.exports = {
+  requireAuth,
+  requireAdmin,
+  requireWriteAccess,
+  JWT_SECRET,
+  // Throttle internals — exported solely for unit-test reach-in. Treat as
+  // private; do not import from production code.
+  _shouldTouchLastLogin,
+  _resetLastLoginThrottleForTests,
+  LAST_LOGIN_THROTTLE_MS
+};

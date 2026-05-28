@@ -1,0 +1,88 @@
+# Keep the Render Free backend warm by pinging /api/health every ~10 min.
+#
+# Why this exists
+# ---------------
+# Render Free instances sleep after ~15 min of inactivity. When a real user
+# hits the FE, the first API call has to wait for the BE to wake up, which
+# surfaces as the "Backend is reconnecting" banner.
+#
+# The proper production fix is to upgrade the Render plan. Until then, an
+# external ping every 10 min keeps the instance warm without contributing
+# to spurious traffic from inside the BE itself.
+#
+# Why every 10 minutes
+# --------------------
+# Render Free has a monthly instance-hour cap. Pinging every minute would
+# (a) reduce idle hours toward zero and risk hitting the cap, and (b) flood
+# the FE access log with health entries that drown out real traffic.
+# 10 min is short enough to stay inside Render's 15-min sleep window with
+# margin, and long enough to keep instance-hour usage well below the cap.
+#
+# Why no secrets in logs
+# ----------------------
+# The full health URL is in repository secrets (BACKEND_HEALTH_URL). We
+# pass it as a step env var (NOT a positional argument) so it is never
+# expanded into a logged shell command and never echoed by the runner.
+#
+# Why a soft-fail
+# ---------------
+# A cold-start ping may take longer than the 20s curl --max-time. The
+# `|| echo` clause swallows that one failure rather than turning the
+# whole scheduled workflow red — the next 10-min tick gives the BE
+# another chance. (If you want to alert on sustained outage, add an
+# UptimeRobot monitor on top of this; see docs/UPTIME_MONITORING.md.)
+
+name: Keep Render Backend Awake
+
+on:
+  schedule:
+    # GitHub schedules can drift by several minutes under load. */10 is fine
+    # because the keep-awake window is 15 min, so even a 4-min delay is safe.
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+# Hard cap on permissions: this workflow only needs to make outbound HTTP
+# calls — no repo writes, no package publishes, no GitHub API mutations.
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    # If a single run hangs (curl shouldn't, but networks are weird) cap
+    # the whole job so we never burn more than a couple of minutes of
+    # action-minutes per scheduled tick.
+    timeout-minutes: 2
+    steps:
+      - name: Ping backend /api/health
+        env:
+          BACKEND_HEALTH_URL: ${{ secrets.BACKEND_HEALTH_URL }}
+        run: |
+          if [ -z "$BACKEND_HEALTH_URL" ]; then
+            echo "::error::BACKEND_HEALTH_URL secret is not configured."
+            echo "::error::Add it in Repo Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+          # -f  → fail on HTTP >= 400 so we can distinguish "got 5xx" from
+          #       "got 200 but body was empty"
+          # -s  → silent (no progress meter in logs)
+          # -S  → still show errors when -s is set
+          # -o /dev/null → discard the body; we only care about status
+          # -w  → print the final HTTP status, which is safe to log
+          # --max-time 20 → 20s wall-clock cap covering DNS + TLS + body
+          echo "Pinging Render backend health endpoint..."
+          HTTP_STATUS=$(curl -fsS --max-time 20 \
+                              -o /dev/null \
+                              -w "%{http_code}" \
+                              "$BACKEND_HEALTH_URL" \
+                        || echo "FAIL")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "OK — backend responded 200."
+          else
+            # Soft-fail: the BE may simply be still waking up. The next
+            # scheduled tick will retry. We DO NOT exit non-zero here so
+            # one flaky tick doesn't go red on the Actions tab.
+            echo "::warning::Ping returned status='$HTTP_STATUS'. Render may be cold-starting; will retry next tick."
+          fi

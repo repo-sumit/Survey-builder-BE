@@ -17,6 +17,8 @@ const importRouter = require('./routes/import');
 const translateRouter = require('./routes/translate');
 const { router: designationsRouter } = require('./routes/designations');
 const accessSheetRouter = require('./routes/accessSheet');
+const healthRouter = require('./routes/health');
+const readyRouter = require('./routes/ready');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -44,6 +46,13 @@ app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
+// Public health endpoint — mounted BEFORE the ensureDB middleware so that
+// external uptime monitors (and the FE warmup probe) can verify Express is
+// up without paying the DB-init cost on cold start. Keeping /api/health
+// DB-independent is what makes the keep-awake ping actually reduce
+// cold-start latency rather than amplify it. See docs/UPTIME_MONITORING.md.
+app.use('/api/health', healthRouter);
+
 // DB init middleware — runs once on first request, then becomes a no-op
 app.use(async (req, res, next) => {
   try {
@@ -55,10 +64,11 @@ app.use(async (req, res, next) => {
   }
 });
 
-// Public routes (no auth)
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'FMB Survey Builder API is running' });
-});
+// Readiness probe — confirms DB is up. Mounted AFTER ensureDB so the first
+// call pays the one-time init cost; subsequent calls become a SELECT 1.
+// Separate from /api/health (liveness) because synthetic monitors and deploy
+// gates need to fail closed when the DB is unreachable.
+app.use('/api/ready', readyRouter);
 
 // Keep-alive endpoint — pings DB to prevent Supabase free-tier pause
 app.get('/api/keep-alive', async (req, res) => {
