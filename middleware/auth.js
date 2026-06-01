@@ -87,7 +87,29 @@ async function trySupabaseJwt(token) {
   try {
     claims = await verifySupabaseToken(token);
   } catch (err) {
-    // Verification failed (wrong signature, expired, unsupported alg, etc.)
+    // verifySupabaseToken throws Error with .code = 'TRANSIENT_INFRA' or
+    // 'INVALID_TOKEN'. A transient JWKS outage MUST NOT surface as 401 —
+    // the FE treats 401 as authoritative and purges the session, which
+    // would log users out for a Supabase blip that has nothing to do with
+    // their token. Returning a 503 reject lets the FE keep the cached
+    // session and show a reconnect banner instead.
+    //
+    // We log only the code, never err.message — upstream messages can
+    // contain DSN-like content or stack traces.
+    const code = err && err.code;
+    if (code === 'TRANSIENT_INFRA') {
+      console.warn('[auth] supabase verifier transient infra failure');
+      return {
+        ok: true,
+        reject: {
+          status: 503,
+          error: 'AUTH_INFRA_TRANSIENT',
+          message: 'Identity provider temporarily unreachable.'
+        }
+      };
+    }
+    // INVALID_TOKEN, missing code, or unknown → preserve existing
+    // behavior: caller treats { ok: false } as 401.
     return { ok: false };
   }
   if (!claims || !claims.email) {

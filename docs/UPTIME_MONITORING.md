@@ -4,6 +4,21 @@ This document explains why the backend needs an external keep-awake ping, how it
 
 ---
 
+## Redundant monitoring is recommended
+
+**The recommended production setup is to run BOTH the GitHub Actions cron AND an external monitor (UptimeRobot or cron-job.org) at the 10-minute cadence, in parallel.**
+
+Two reasons this matters:
+
+1. **GitHub auto-disables scheduled workflows after 60 days of repo inactivity.** If nobody commits to the repo for two months, the `keep-render-awake.yml` cron silently stops firing — and you won't notice until a user reports a cold-start banner. An external monitor on UptimeRobot or cron-job.org has no such dependency on commit activity.
+2. **GH Actions does not page you when the BE is actually down.** UptimeRobot has built-in email / Slack / webhook alerting; the GH workflow only logs to the Actions tab. Layering them gives you keep-awake redundancy *and* outage alerting.
+
+**Running two parallel pingers against `/api/health` is SAFE and supported.** The endpoint is DB-free (mounted before `ensureDB`), idempotent, stateless, and intentionally cheap. Two hits per 10-minute window (one from GH Actions, one from UptimeRobot/cron-job.org) is well within Render free-tier limits and produces no measurable load. Do not push past two parallel monitors — three or more starts to clutter the access log and burn idle hours for no extra reliability.
+
+See **Option 1** (GH Actions) and **Option 2 / Option 3** (UptimeRobot / cron-job.org) below for setup instructions for each leg.
+
+---
+
 ## Why this exists
 
 The Survey Builder backend runs on a **Render Free** instance. Render's free tier sleeps services after approximately **15 minutes of inactivity**. When a real user signs in and the FE makes its first API call to a sleeping instance, Render has to spin the container back up — typically **10–40 seconds**. During that wake-up window the FE displays the non-blocking banner:
@@ -89,6 +104,8 @@ After committing the workflow file and adding the secret, go to **Actions → Ke
 ### Behaviour on a cold-start ping
 
 If the BE is asleep when the workflow runs, the curl may exceed the 20s timeout. The workflow logs a `::warning::` and exits 0 so the Actions tab does not turn red — the next 10-minute tick will succeed once Render has finished waking the container. This is intentional: one flaky tick is not an outage signal.
+
+> **The green Actions tab is NOT an uptime SLO.** Because `keep-render-awake.yml` is intentionally soft-fail (exits 0 on warning), a genuine multi-hour BE outage will still show every run as green — the tab cannot turn red on real downtime. Do not use the Actions tab as your "is the BE up?" signal. For pager-style alerting on actual outages, layer **UptimeRobot** (Option 2) on top of the GH Actions cron; UptimeRobot has built-in email / Slack / webhook alerts that fire on consecutive failed probes.
 
 ### To pause / disable
 
@@ -189,3 +206,25 @@ The free workaround is just that — a workaround. Production reliability beyond
 - **Does not check the DB.** The endpoint is intentionally DB-free. A separate `/api/keep-alive` route exists for the rare case you want to nudge Postgres; if you ever wire a monitor at that path, expect occasional 503s during Supabase / Render maintenance.
 - **Does not check business endpoints.** Survey CRUD, auth, etc. are not in the keep-awake path. Failure of those routes will not surface here. Add domain-specific synthetic monitors if you need that depth.
 - **Does not alert by default (GH Actions only).** If you want pager-style alerts, layer UptimeRobot or cron-job.org notifications on top of (or instead of) the workflow.
+
+> **Reminder — do not point any keep-awake monitor at `/api/ready` or `/api/keep-alive`.** Both routes execute `SELECT 1` against Postgres on every call, so pointing a 10-minute pinger at them would amplify DB load instead of just nudging Express awake. Keep all keep-awake monitors (GH Actions, UptimeRobot, cron-job.org) on `/api/health` — the DB-free liveness probe. Use `/api/ready` only for monitors that specifically need to alert on DB outages, and at a much lower frequency.
+
+---
+
+## A separate, unrelated cron: `vercel.json` → `/api/keep-alive` (daily 08:00 UTC)
+
+The BE's `vercel.json` declares its own scheduled cron:
+
+```json
+"crons": [
+  { "path": "/api/keep-alive", "schedule": "0 8 * * *" }
+]
+```
+
+This is a **completely separate concern** from everything else in this document:
+
+- It runs **on Vercel**, not on Render. It only fires when the BE is deployed to Vercel.
+- It targets `/api/keep-alive`, which **does** hit Postgres (`SELECT 1`) — deliberately, because its job is to keep the DB connection from idling out, not to keep Render's container warm.
+- It fires **once a day at 08:00 UTC**, not every 10 minutes.
+
+In short: the GH Actions workflow described above keeps Render's *container* warm by pinging the DB-free `/api/health` every 10 min. The Vercel cron keeps the *Postgres connection* warm by pinging `/api/keep-alive` once a day. They are not substitutes for each other and should not be confused.
